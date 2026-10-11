@@ -231,31 +231,27 @@ CREATE TABLE ztime_approval (
 );
 COMMENT ON TABLE ztime_approval IS 'Z-table: per-person/period approval queue entry (Approval screen). Real SAP derives this from CATSDB.STATUS + workflow.';
 
--- Project leader roster: who can act as leader for mass entry, and which
--- projects/WBS elements they are scoped to (ownership, not line management).
-CREATE TABLE ztime_leader (
-  leader_id   VARCHAR(10)  PRIMARY KEY,   -- e.g. "RN"
-  pernr       CHAR(8)      NOT NULL REFERENCES pa0002_personal_data(pernr),
-  label       VARCHAR(60)  NOT NULL,      -- short label shown in "Acting as", e.g. "RTL-TT + AXI-INT"
-  bukrs       CHAR(4)      NOT NULL REFERENCES t001_company_code(bukrs)
-);
-COMMENT ON TABLE ztime_leader IS 'Z-table: mass-entry leader roster (project ownership, not org-chart line management).';
+-- Project managers ("leaders" in the app's own language, for mass entry)
+-- are NOT a separate Z-table: they are registered on the project master
+-- data itself, proj_project_definition.responsible_pernr — exactly like
+-- SAP PS, where a project's responsible person lives on PROJ, not on a
+-- bolt-on customer table. "Which projects does this person manage?" is a
+-- plain query: SELECT pspid FROM proj_project_definition WHERE
+-- responsible_pernr = :pernr. The "Acting as" UI list is the same query,
+-- distinct by pernr, joined to pa0002 for the display name and to
+-- pa0001 for the company filter — no stored leader roster needed.
 
-CREATE TABLE ztime_leader_project (
-  leader_id  VARCHAR(10)  NOT NULL REFERENCES ztime_leader(leader_id),
-  pspid      VARCHAR(12)  NOT NULL REFERENCES proj_project_definition(pspid),
-  PRIMARY KEY (leader_id, pspid)
-);
-COMMENT ON TABLE ztime_leader_project IS 'Z-table: which projects each leader owns, for Team mass-entry scoping.';
-
--- Team roster membership: who belongs to which leader's team for mass entry
--- (ownership-based, independent of PA0001's own cost-center/line reporting).
+-- Team roster membership: who belongs to which project's team for mass
+-- entry, scoped directly to the project (ownership, independent of
+-- PA0001's own cost-center/line reporting). A project's managers (via
+-- responsible_pernr) see this roster for every project they are
+-- responsible for.
 CREATE TABLE ztime_team_member (
-  leader_id  VARCHAR(10)  NOT NULL REFERENCES ztime_leader(leader_id),
-  pernr      CHAR(8)      NOT NULL REFERENCES pa0002_personal_data(pernr),
-  PRIMARY KEY (leader_id, pernr)
+  pspid  VARCHAR(12)  NOT NULL REFERENCES proj_project_definition(pspid),
+  pernr  CHAR(8)      NOT NULL REFERENCES pa0002_personal_data(pernr),
+  PRIMARY KEY (pspid, pernr)
 );
-COMMENT ON TABLE ztime_team_member IS 'Z-table: team membership for mass entry, scoped by project ownership (see ztime_leader_project).';
+COMMENT ON TABLE ztime_team_member IS 'Z-table: team membership for mass entry, scoped directly to the project — ownership of who manages it comes from proj_project_definition.responsible_pernr, not from this table.';
 
 -- ============================================================================
 -- Explicitly out of scope: AI suggestions (chat.* state, "sugs" arrays) are

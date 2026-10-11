@@ -194,57 +194,42 @@ INSERT INTO ztime_company_cfg (bukrs, profile_code, begda) VALUES
   ('PT01', 'Z_CONS', '2020-01-01'),
   ('PT02', 'Z_BSRV', '2020-01-01');
 
--- Mass-entry leader roster (ZTIME_LEADER/ZTIME_LEADER_PROJECT), from LEADERS
-INSERT INTO ztime_leader (leader_id, pernr, label, bukrs) VALUES
-  ('RN', '00104506', 'RTL-TT + AXI-INT', 'PT01'),
-  ('PA', '00104507', 'AER-WFM', 'PT01'),
-  ('AF', '00104508', 'BNK-2026', 'PT01'),
-  ('CP', '00104509', 'HSP-FAC', 'PT02'),
-  ('MS', '00104522', 'AER-FAC', 'PT02');
-
-INSERT INTO ztime_leader_project (leader_id, pspid) VALUES
-  ('RN', 'RTL-TT'),
-  ('RN', 'AXI-INT'),
-  ('PA', 'AER-WFM'),
-  ('AF', 'BNK-2026'),
-  ('CP', 'HSP-FAC'),
-  ('MS', 'AER-FAC');
-
--- Team membership for mass entry (ZTIME_TEAM_MEMBER), from TEAM[].projs
--- (project index -> owning leader). Rui Tavares has two rows: he works on
--- both Ana Ferreira's and Pedro Alves's projects, the mock's one deliberate
--- multi-project example.
-INSERT INTO ztime_team_member (leader_id, pernr) VALUES
-  ('AF', '00104501'),
-  ('AF', '00104504'),
-  ('PA', '00104504'),
-  ('AF', '00104513'),
-  ('AF', '00104514'),
-  ('AF', '00104515'),
-  ('RN', '00104502'),
-  ('RN', '00104503'),
-  ('RN', '00104516'),
-  ('RN', '00104517'),
-  ('RN', '00104518'),
-  ('PA', '00104505'),
-  ('PA', '00104519'),
-  ('PA', '00104520'),
-  ('PA', '00104521'),
-  ('RN', '00104523'),
-  ('RN', '00104524'),
-  ('RN', '00104525'),
-  ('RN', '00104526'),
-  ('RN', '00104527'),
-  ('CP', '00104510'),
-  ('CP', '00104511'),
-  ('CP', '00104512'),
-  ('CP', '00104528'),
-  ('CP', '00104529'),
-  ('MS', '00104530'),
-  ('MS', '00104531'),
-  ('MS', '00104532'),
-  ('MS', '00104533'),
-  ('MS', '00104534');
+-- Team membership for mass entry (ZTIME_TEAM_MEMBER), from TEAM[].projs,
+-- linked straight to the project (pspid). Rui Tavares has two rows: he
+-- works on both BNK-2026 and AER-WFM, the mock's one deliberate
+-- multi-project example. Who manages each of these projects is already
+-- on proj_project_definition.responsible_pernr, not repeated here.
+INSERT INTO ztime_team_member (pspid, pernr) VALUES
+  ('BNK-2026', '00104501'),
+  ('BNK-2026', '00104504'),
+  ('AER-WFM', '00104504'),
+  ('BNK-2026', '00104513'),
+  ('BNK-2026', '00104514'),
+  ('BNK-2026', '00104515'),
+  ('RTL-TT', '00104502'),
+  ('RTL-TT', '00104503'),
+  ('RTL-TT', '00104516'),
+  ('RTL-TT', '00104517'),
+  ('RTL-TT', '00104518'),
+  ('AER-WFM', '00104505'),
+  ('AER-WFM', '00104519'),
+  ('AER-WFM', '00104520'),
+  ('AER-WFM', '00104521'),
+  ('AXI-INT', '00104523'),
+  ('AXI-INT', '00104524'),
+  ('AXI-INT', '00104525'),
+  ('AXI-INT', '00104526'),
+  ('AXI-INT', '00104527'),
+  ('HSP-FAC', '00104510'),
+  ('HSP-FAC', '00104511'),
+  ('HSP-FAC', '00104512'),
+  ('HSP-FAC', '00104528'),
+  ('HSP-FAC', '00104529'),
+  ('AER-FAC', '00104530'),
+  ('AER-FAC', '00104531'),
+  ('AER-FAC', '00104532'),
+  ('AER-FAC', '00104533'),
+  ('AER-FAC', '00104534');
 
 -- CATSDB hours rows — PT01 weeks (My Timesheet, Consulting), from WEEKS_PT01
 -- CATSDB hours rows — PT02 weeks (Building Solutions), from WEEKS_PT02

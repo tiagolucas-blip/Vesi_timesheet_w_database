@@ -29,7 +29,7 @@ de IA) é uma funcionalidade de aplicação, não dado SAP, e não tem tabela �
 | `pa0007_planned_hours` | Infotype 0007, Horário de Trabalho Previsto — horas diárias | `TEAM[].dailyHours` / capacidade |
 | `t554t_absence_type` | Textos de tipos de ausência | `ABSENCE_TYPES[]` |
 | `t512w_wage_type` | Características de tipos de remuneração + textos (T512T fundido) | `WAGETYPES[]` |
-| `proj_project_definition` | Definição de Projeto (PS) | `PROJECTS[].pspid/name` |
+| `proj_project_definition` | Definição de Projeto (PS) — inclui `responsible_pernr`, o gestor do projeto, registado no próprio dado mestre, como no SAP PS real | `PROJECTS[].pspid/name`, `LEADERS[].name` |
 | `prps_wbs_element` | Elemento WBS — objeto recetor real do lançamento | `PROJECTS[].wbs`, `receiverObjectLabel()` |
 | `catsdb` | **CATSDB** — tabela central de registo de tempos; linhas de horas, ausências e allowances/bónus convivem aqui tal como no SAP real | `WEEKS_PT01`, `WEEKS_PT02`, lançamentos diários, allowances |
 | `pa2001_absences` | Infotype 2001, Ausências (pedido de férias/ausência, lido como read-only) | `ABSENCES[]` |
@@ -41,12 +41,19 @@ de IA) é uma funcionalidade de aplicação, não dado SAP, e não tem tabela �
 | `ztime_profile` | Perfil de entrada CATS (duração vs. picagem); no SAP real isto é customizing (`V_T555A` e afins), não uma tabela única | lógica `Z_CONS`/`Z_BSRV` do ecrã "CATS mapping" |
 | `ztime_company_cfg` | Liga sociedade → perfil CATS, com validade | mapeamento sociedade→perfil usado em `goToScreen`/render |
 | `ztime_approval` | Fila de aprovação por pessoa/período; no SAP real é derivado de `CATSDB.STATUS` + workflow, não uma master table | `state.approvals` |
-| `ztime_leader` | Roster de líderes para lançamento em massa (ownership de projeto, não hierarquia PA0001) | `LEADERS[]` |
-| `ztime_leader_project` | Projetos que cada líder pode gerir | âmbito de `LEADERS[].projects` |
-| `ztime_team_member` | Pertença de equipa para lançamento em massa | `LEADERS[].teamPernrs` / ecrã Team |
+| `ztime_team_member` | Pertença de equipa para lançamento em massa, ligada diretamente ao projeto | `LEADERS[].teamPernrs` / ecrã Team |
 
 ## Notas de desenho
 
+- **Gestores de projeto (líderes)**: não têm tabela Z própria. O gestor de
+  um projeto fica registado no próprio dado mestre do projeto —
+  `proj_project_definition.responsible_pernr` — tal como no SAP PS real,
+  onde o responsável vive em PROJ, não numa tabela de cliente ao lado.
+  "Que projetos gere esta pessoa?" é uma simples consulta (`SELECT pspid
+  FROM proj_project_definition WHERE responsible_pernr = :pernr`), nunca
+  uma tabela de associação separada. A lista "Acting as" da UI é a mesma
+  consulta, distinta por `pernr`, ligada a `pa0002` para o nome e a
+  `pa0001` para filtrar por sociedade.
 - **`catsdb`** é deliberadamente a tabela mais carregada: no SAP real,
   CATSDB mistura linhas de horas (`CATSHOURS`/`BEGUZ`/`ENDUZ`), linhas de
   allowance/bónus (`LGART`+`ANZHL`/`CATSAMOUNT`) e marcadores de ausência
