@@ -6,10 +6,20 @@ Documents that accompany this repository:
 
 - UX/UI Specification, 23 sections, from principles to acceptance criteria
 - Annex A, mapping the interface to SAP concepts and CATSDB fields
+- `db/SCHEMA.md`, the SAP-representative PostgreSQL schema behind this
+  app, and `db/API.md`/`db/DEPLOY.md` for the API layer and production
+  deploy
+
+This fork is backed by a real PostgreSQL database modeled on the SAP
+tables a production CATS integration would actually read and write (see
+`db/SCHEMA.md`). The frontend loads everything from `api/bootstrap.js` on
+start and writes through `api/*.js` on Save, Submit, Team mass entry and
+Approval — not from the in-memory literals the original prototype used.
 
 ## What the prototype does
 
-Everything below works, with no server and no real data.
+Everything below works end to end, against a real database (see
+"Data" further down for exactly what is and isn't persisted).
 
 **Recording**
 - Weekly grid with inline editing, accepts `1.5`, `1:30` and `90m`, rounded to 15 minutes
@@ -73,14 +83,28 @@ Everything below works, with no server and no real data.
 ## Structure
 
 ```
-body.html      page content, single source of truth for the markup
-styles.css     color and typography tokens, light and dark theme
-app.js         all the logic, no external dependencies
-index.html     the complete document, what Vercel serves  (generated)
-artifact.html  the same page without the shell, to publish as an Artifact  (generated)
-tools/build.py generates the two files above from body.html
-api/chat.js    optional serverless function, off by default
-vercel.json    static site configuration
+body.html         page content, single source of truth for the markup
+styles.css        color and typography tokens, light and dark theme
+app.js            all the logic; loads data from api/bootstrap.js on start
+index.html        the complete document, what Vercel serves  (generated)
+artifact.html     the same page without the shell, to publish as an Artifact  (generated)
+tools/build.py     generates the two files above from body.html
+api/_db.js        shared Postgres pool (pg), not a route
+api/bootstrap.js  one-call load of everything the frontend needs
+api/timesheet.js  My Timesheet: read a week, Save (POST)
+api/timesheet-submit.js   Submit a saved week
+api/team.js       Team mass-entry roster
+api/team-entry.js Team mass-entry Save
+api/approvals.js  Approval queue read + approve
+api/employee.js, api/projects.js, api/leaders.js, api/absences.js, api/reference.js
+                  smaller read-only endpoints, mostly superseded by bootstrap.js
+api/chat.js       optional serverless function (the assistant), off by default
+db/schema.sql     PostgreSQL DDL (SAP-representative tables + Z-custom ones)
+db/seed.sql       fictional sample data matching the schema
+db/SCHEMA.md      what each table is and what it replaces
+db/API.md         the API surface
+db/DEPLOY.md      production deploy steps (Neon/Vercel Postgres)
+vercel.json       static site + functions configuration
 ```
 
 After editing `body.html`, run:
@@ -91,22 +115,29 @@ python3 tools/build.py
 
 ## Running locally
 
-The page needs no build and no dependencies:
+Needs a real Postgres (the frontend fetches `api/bootstrap.js` on load, which needs `DATABASE_URL`):
 
 ```bash
-python3 -m http.server 8000
-# open http://localhost:8000
+# once: create a local Postgres database, then
+psql $DATABASE_URL -f db/schema.sql
+psql $DATABASE_URL -f db/seed.sql
+
+npm install    # pg + @anthropic-ai/sdk
+cp .env.example .env    # adjust DATABASE_URL if needed
+vercel dev     # serves the static files AND api/*.js together
 ```
 
-`python3 -m http.server` only serves static files, it doesn't run `api/chat.js`. In that mode the assistant always falls back to the local regex interpreter, which is enough to review the rest of the application. To test the Claude connection locally, run `vercel dev` (needs `@anthropic-ai/sdk` installed with `npm install` and `ANTHROPIC_API_KEY` in the environment).
+A plain `python3 -m http.server` only serves static files — `app.js` will fetch `api/bootstrap.js`, get a 404, and the boot screen never clears. `vercel dev` (or an equivalent local server that also runs `api/*.js`, see `db/API.md`) is required, not optional, for this fork.
+
+Without `ANTHROPIC_API_KEY`, the assistant's natural-language input still falls back to the local regex interpreter — that part is unrelated to the database and works the same as before.
 
 ## Publishing to Vercel
 
-The project is mostly static, with a serverless function at `api/chat.js`. Import the repository into Vercel and accept the defaults, no framework preset, no build command, with the root as the output directory. `vercel.json` already carries that configuration. Set `ANTHROPIC_API_KEY` in the project's environment variables to enable the Claude-powered assistant.
+See `db/DEPLOY.md` for the full step-by-step (creating the Vercel project, provisioning Postgres via Neon, loading `db/schema.sql`/`db/seed.sql`, environment variables). Short version: import the repository into Vercel (framework preset **Other**, `vercel.json` already carries the rest of the configuration), add a Postgres database from the project's Storage tab (sets `DATABASE_URL` automatically), load the schema+seed against it, then set `ANTHROPIC_API_KEY` if you want the Claude-powered assistant too.
 
 ## Data
 
-There's no real data. Employee, projects, WBS, cost centers and absences are made up and live as constants at the top of `app.js`. No request leaves the browser, except what the assistant sends to `api/chat.js` when Claude is enabled (the typed text and the week's context described above). No data is stored, there's no local storage and no cookies.
+Employee, projects, WBS, cost centers, team, absences and the weekly timesheet data are real rows in Postgres (`db/schema.sql`, seeded with fictional sample data by `db/seed.sql` — see `db/SCHEMA.md` for how each table maps to a real SAP table or a documented Z-custom extension). `app.js` holds no mock arrays of that data anymore; it loads everything from `api/bootstrap.js` on start and writes through `api/*.js`. Two small things stay as static client-side samples, by design, because neither has a real SAP table to live in (see `api/bootstrap.js`'s own header comment): assistant suggestions, and each Team-screen member's day-level absence flag for everyone except the self-service user. No request leaves the browser except to this app's own `api/*.js` and, when Claude is enabled, to `api/chat.js`. No local storage, no cookies, beyond the language preference.
 
 ## Known limits, by design
 
@@ -114,7 +145,8 @@ There's no real data. Employee, projects, WBS, cost centers and absences are mad
 - Whether the standard `CAT6` transfer maps `CATSAMOUNT` to `IT2010 BETRG` automatically, or needs configuring, is flagged as an open question in the payload, not solved
 - Without `ANTHROPIC_API_KEY` configured, the natural-language interpreter is deterministic, based on regular expressions. It recognizes duration, day and project prefix, and nothing else. See the next section to connect Claude
 - Each request to the assistant is independent, with no memory of the previous turn
-- There's no authentication or profiles, the user is fixed
+- There's no authentication or profiles, the user is fixed — and the API accepts any `pernr` in a request without checking who's actually calling it; fine for this demo, not for an environment with real data (see `db/DEPLOY.md`)
+- Assistant suggestions and each Team-screen member's day-level absence flag (except the self-service user's own) are static client-side samples, not read from the database — neither has a real SAP table to live in (`api/bootstrap.js` explains why)
 
 ## Connecting Claude to the assistant
 
