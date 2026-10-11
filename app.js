@@ -5,21 +5,10 @@
   /* bukrs ties a project to the company it belongs to, so staffing stays
      thematically consistent: a payroll or WFM engagement is consulting
      work (PT01), a facilities engagement is building solutions (PT02).
-     null means shared, open internal work, not tied to either theme. */
-  var PROJECTS = [
-    {code:"BNK-2026", wbs:"BNK-2026.1.3", name:"Banking, Payroll and ECP", act:"Functional consulting", proj:true, bukrs:"PT01", budget:480,
-     sap:{rproj:"BNK-2026.1.3", lstar:"CONS01", skostl:"PT4010", rkostl:"", aufnr:""}},
-    {code:"RTL-TT", wbs:"RTL-TT.2.1", name:"Retail, Time Tracking", act:"Functional consulting", proj:true, bukrs:"PT01", budget:360,
-     sap:{rproj:"RTL-TT.2.1", lstar:"CONS01", skostl:"PT4010", rkostl:"", aufnr:""}},
-    {code:"AER-WFM", wbs:"AER-WFM.4.2", name:"Airports, WFM rollout", act:"Project management", proj:true, bukrs:"PT01", budget:600,
-     sap:{rproj:"AER-WFM.4.2", lstar:"PMGT01", skostl:"PT4010", rkostl:"", aufnr:""}},
-    {code:"AXI-INT", wbs:"", name:"Internal, pre-sales and training", act:"Administrative", proj:false, bukrs:null,
-     sap:{rproj:"", lstar:"ADMIN1", skostl:"PT4010", rkostl:"PT4010", aufnr:""}},
-    {code:"HSP-FAC", wbs:"HSP-FAC.1.1", name:"Hospital campus, facilities maintenance", act:"Field service", proj:true, bukrs:"PT02", budget:300,
-     sap:{rproj:"HSP-FAC.1.1", lstar:"MAINT01", skostl:"PT4010", rkostl:"", aufnr:""}},
-    {code:"AER-FAC", wbs:"AER-FAC.2.1", name:"Airport terminal, facilities maintenance", act:"Field service", proj:true, bukrs:"PT02", budget:260,
-     sap:{rproj:"AER-FAC.2.1", lstar:"MAINT01", skostl:"PT4010", rkostl:"", aufnr:""}}
-  ];
+     null means shared, open internal work, not tied to either theme.
+     Loaded from GET /api/bootstrap (proj_project_definition/prps_wbs_element
+     in the real database) by loadBootstrap() below, not a literal here. */
+  var PROJECTS = [];
   var PERNR = "00104567";
   var WORKDATES = [];
   var DAYCAP = 8;
@@ -34,18 +23,13 @@
      dates, so a retroactive entry keeps the profile that was in force then.
      Start and end are BEGUZ and ENDUZ, standard CATSDB fields whose visibility
      is controlled by the profile, not by code in this application. */
-  var COMPANIES = [
-    {bukrs:"PT01", name:"Consulting and digital services"},
-    {bukrs:"PT02", name:"Building solutions and maintenance"}
-  ];
-  var PROFILES = {
-    Z_CONS:{code:"Z_CONS", name:"Consultants",       clock:false, overnight:false, fields:"Date, project, duration"},
-    Z_BSRV:{code:"Z_BSRV", name:"Building Solutions", clock:true,  overnight:true,  fields:"Date, project, start, end, computed duration"}
-  };
-  var ZTIME_COMPANY_CFG = [
-    {bukrs:"PT01", begda:"20200101", endda:"99991231", profile:"Z_CONS"},
-    {bukrs:"PT02", begda:"20200101", endda:"99991231", profile:"Z_BSRV"}
-  ];
+  /* COMPANIES, PROFILES and ZTIME_COMPANY_CFG are all loaded from the
+     database by loadBootstrap() below (t001_company_code, ztime_profile,
+     ztime_company_cfg) — declared here only so every function that closes
+     over them keeps working unchanged once they're populated. */
+  var COMPANIES = [];
+  var PROFILES = {};
+  var ZTIME_COMPANY_CFG = [];
   var DEFAULT_PROFILE = "Z_CONS";
 
   /* IT0001 of the person using the application. The switch in the header changes
@@ -98,13 +82,7 @@
      entry profile. Quantity goes to ANZHL. The bonus is the only one carrying
      an amount, which CATSDB has no field for, so it travels in a customer
      field and is created by the project owner, never by the employee. */
-  var WAGETYPES = [
-    {code:"AJC_NAC", lgart:"1200", name:"Domestic per diem",  unit:"days",   amount:false, needProj:true,  noteLabel:"",                     selfEntry:true},
-    {code:"AJC_INT", lgart:"1210", name:"Foreign per diem",   unit:"days",   amount:false, needProj:true,  noteLabel:"Country",              selfEntry:true},
-    {code:"KMS",     lgart:"1300", name:"Own-car kilometres", unit:"km",     amount:false, needProj:true,  noteLabel:"Origin and destination", selfEntry:true},
-    {code:"TURNO",   lgart:"1500", name:"Shift allowance",    unit:"days",   amount:false, needProj:false, noteLabel:"",                     selfEntry:true},
-    {code:"BONUS",   lgart:"1400", name:"Project bonus",      unit:"amount", amount:true,  needProj:true,  noteLabel:"Reason",               selfEntry:false}
-  ];
+  var WAGETYPES = []; // loaded from t512w_wage_type by loadBootstrap() below
   function wt(code){ return WAGETYPES.filter(function(w){ return w.code === code; })[0]; }
   function wtFor(bukrs){
     /* Shift allowance only makes sense where people work shifts. */
@@ -125,50 +103,45 @@
      leader can still own more than one project at once, as Ricardo Nunes
      does here: switching the project picker switches which 5-person
      roster is on screen. */
-  var LEADERS = [
-    {id:"RN", name:"Ricardo Nunes", label:"RTL-TT + AXI-INT", projs:[1,3], bukrs:"PT01"},
-    {id:"PA", name:"Pedro Alves",   label:"AER-WFM", projs:[2], bukrs:"PT01"},
-    {id:"AF", name:"Ana Ferreira",  label:"BNK-2026", projs:[0], bukrs:"PT01"},
-    {id:"CP", name:"Carlos Pinto",  label:"HSP-FAC", projs:[4], bukrs:"PT02"},
-    {id:"MS", name:"Marco Silva",   label:"AER-FAC", projs:[5], bukrs:"PT02"}
-  ];
-  var TEAM = [
-    /* BNK-2026 */
-    {pernr:"00104501", name:"Marta Silva",     role:"Consultant",        bukrs:"PT01", projs:[0],   abs:{}, already:[8,8,4,0,0,0,0]},
-    {pernr:"00104504", name:"Rui Tavares",     role:"Consultant",        bukrs:"PT01", projs:[0,2], abs:{}, already:[8,0,8,0,0,0,0]},
-    {pernr:"00104513", name:"Beatriz Costa",   role:"Consultant",        bukrs:"PT01", projs:[0],   abs:{}, dailyHours:6, already:[6,6,0,0,0,0,0]},
-    {pernr:"00104514", name:"Tiago Almeida",   role:"Consultant",        bukrs:"PT01", projs:[0],   abs:{3:"Medical appointment"}, already:[8,4,0,0,0,0,0]},
-    {pernr:"00104515", name:"Mariana Neves",   role:"Junior consultant", bukrs:"PT01", projs:[0],   abs:{}, already:[0,8,8,0,0,0,0]},
-    /* RTL-TT */
-    {pernr:"00104502", name:"João Costa",      role:"Consultant",        bukrs:"PT01", projs:[1],   abs:{4:"Vacation"}, already:[4,4,4,4,0,0,0]},
-    {pernr:"00104503", name:"Inês Braga",      role:"Junior consultant", bukrs:"PT01", projs:[1],   abs:{}, locked:true, already:[8,8,8,8,8,0,0]},
-    {pernr:"00104516", name:"Vera Antunes",    role:"Consultant",        bukrs:"PT01", projs:[1],   abs:{}, already:[8,0,8,0,0,0,0]},
-    {pernr:"00104517", name:"Gonçalo Pinheiro",role:"Senior consultant", bukrs:"PT01", projs:[1],   abs:{}, already:[8,8,8,0,0,0,0]},
-    {pernr:"00104518", name:"Teresa Correia",  role:"Consultant",        bukrs:"PT01", projs:[1],   abs:{1:"Vacation"}, already:[8,0,4,0,0,0,0]},
-    /* AER-WFM */
-    {pernr:"00104505", name:"Sofia Marques",   role:"Architect",         bukrs:"PT01", projs:[2],   abs:{2:"Medical appointment"}, already:[0,4,4,8,0,0,0]},
-    {pernr:"00104519", name:"Vasco Pereira",   role:"Architect",         bukrs:"PT01", projs:[2],   abs:{}, already:[8,8,4,0,0,0,0]},
-    {pernr:"00104520", name:"Miguel Santos",   role:"Consultant",        bukrs:"PT01", projs:[2],   abs:{}, already:[4,4,0,0,0,0,0]},
-    {pernr:"00104521", name:"Rita Nunes",      role:"Consultant",        bukrs:"PT01", projs:[2],   abs:{}, already:[8,0,0,0,0,0,0]},
-    /* AXI-INT */
-    {pernr:"00104523", name:"Bárbara Moreira", role:"Consultant",        bukrs:"PT01", projs:[3],   abs:{}, already:[4,0,0,0,0,0,0]},
-    {pernr:"00104524", name:"Eduardo Cardoso", role:"Junior consultant", bukrs:"PT01", projs:[3],   abs:{},  already:[0,4,4,0,0,0,0]},
-    {pernr:"00104525", name:"Sara Martins",    role:"Consultant",        bukrs:"PT01", projs:[3],   abs:{0:"Vacation"}, already:[0,4,0,0,0,0,0]},
-    {pernr:"00104526", name:"Cláudia Ribeiro", role:"Architect",         bukrs:"PT01", projs:[3],   abs:{}, already:[8,0,4,0,0,0,0]},
-    {pernr:"00104527", name:"Diogo Ferreira",  role:"Consultant",        bukrs:"PT01", projs:[3],   abs:{}, already:[0,0,0,4,0,0,0]},
-    /* HSP-FAC */
-    {pernr:"00104510", name:"Nuno Dias",       role:"Technician",        bukrs:"PT02", projs:[4],   abs:{}, already:[8,8,0,0,0,0,0]},
-    {pernr:"00104511", name:"Hélder Rocha",    role:"Technician",        bukrs:"PT02", projs:[4],   abs:{}, dailyHours:6, already:[0,0,6,6,6,0,0]},
-    {pernr:"00104512", name:"Hugo Matos",      role:"Technician",        bukrs:"PT02", projs:[4],   abs:{1:"Vacation"}, already:[8,0,8,8,0,0,0]},
-    {pernr:"00104528", name:"Luís Teixeira",   role:"Technician",        bukrs:"PT02", projs:[4],   abs:{}, already:[8,8,8,0,0,0,0]},
-    {pernr:"00104529", name:"Sandra Fonseca",  role:"Senior technician", bukrs:"PT02", projs:[4],   abs:{}, already:[0,8,8,8,0,0,0]},
-    /* AER-FAC */
-    {pernr:"00104530", name:"Ana Pires",       role:"Technician",        bukrs:"PT02", projs:[5],   abs:{}, already:[8,8,0,0,0,0,0]},
-    {pernr:"00104531", name:"Bruno Alves",     role:"Technician",        bukrs:"PT02", projs:[5],   abs:{2:"Vacation"}, already:[8,0,8,0,0,0,0]},
-    {pernr:"00104532", name:"Carla Sousa",     role:"Senior technician", bukrs:"PT02", projs:[5],   abs:{}, already:[0,8,8,8,0,0,0]},
-    {pernr:"00104533", name:"Daniel Matos",    role:"Technician",        bukrs:"PT02", projs:[5],   abs:{}, dailyHours:6, already:[6,6,0,0,0,0,0]},
-    {pernr:"00104534", name:"Elsa Carvalho",   role:"Technician",        bukrs:"PT02", projs:[5],   abs:{0:"Medical appointment"}, already:[0,8,8,0,0,0,0]}
-  ];
+  var LEADERS = []; // loaded from proj_project_definition.responsible_pernr (see SCHEMA.md) by loadBootstrap() below
+  var TEAM = []; // loaded from ztime_team_member by loadBootstrap() below
+  /* Two things TEAM never got out of the mock, by design (see api/bootstrap.js's
+     own header comment): each member's approved-absence day(s) for the Team
+     grid (abs) and their already-recorded baseline for the landing week
+     (already) — neither has a seeded table for the other 28 people, only for
+     the self-service user. Kept as the exact same static sample as before,
+     merged onto the DB-loaded roster in loadBootstrap(), keyed by pernr. */
+  var TEAM_SAMPLE_OVERLAY = {
+    "00104501": {already:[8,8,4,0,0,0,0]},
+    "00104504": {already:[8,0,8,0,0,0,0]},
+    "00104513": {already:[6,6,0,0,0,0,0]},
+    "00104514": {abs:{3:"Medical appointment"}, already:[8,4,0,0,0,0,0]},
+    "00104515": {already:[0,8,8,0,0,0,0]},
+    "00104502": {abs:{4:"Vacation"}, already:[4,4,4,4,0,0,0]},
+    "00104503": {locked:true, already:[8,8,8,8,8,0,0]},
+    "00104516": {already:[8,0,8,0,0,0,0]},
+    "00104517": {already:[8,8,8,0,0,0,0]},
+    "00104518": {abs:{1:"Vacation"}, already:[8,0,4,0,0,0,0]},
+    "00104505": {abs:{2:"Medical appointment"}, already:[0,4,4,8,0,0,0]},
+    "00104519": {already:[8,8,4,0,0,0,0]},
+    "00104520": {already:[4,4,0,0,0,0,0]},
+    "00104521": {already:[8,0,0,0,0,0,0]},
+    "00104523": {already:[4,0,0,0,0,0,0]},
+    "00104524": {already:[0,4,4,0,0,0,0]},
+    "00104525": {abs:{0:"Vacation"}, already:[0,4,0,0,0,0,0]},
+    "00104526": {already:[8,0,4,0,0,0,0]},
+    "00104527": {already:[0,0,0,4,0,0,0]},
+    "00104510": {already:[8,8,0,0,0,0,0]},
+    "00104511": {already:[0,0,6,6,6,0,0]},
+    "00104512": {abs:{1:"Vacation"}, already:[8,0,8,8,0,0,0]},
+    "00104528": {already:[8,8,8,0,0,0,0]},
+    "00104529": {already:[0,8,8,8,0,0,0]},
+    "00104530": {already:[8,8,0,0,0,0,0]},
+    "00104531": {abs:{2:"Vacation"}, already:[8,0,8,0,0,0,0]},
+    "00104532": {already:[0,8,8,8,0,0,0]},
+    "00104533": {already:[6,6,0,0,0,0,0]},
+    "00104534": {abs:{0:"Medical appointment"}, already:[0,8,8,0,0,0,0]}
+  };
   function leaderById(id){ return LEADERS.filter(function(l){ return l.id === id; })[0] || LEADERS[0]; }
   function teamOf(leaderId){
     var l = leaderById(leaderId);
@@ -342,7 +315,7 @@
      WEEKS; "created by"/"last changed" have no real history to read in
      this mockup, so they're a stable (not random - same row always shows
      the same values) pseudo date derived from a seed, not a live clock. */
-  var EMPLOYEE_NAME = "Tiago Leal";
+  var EMPLOYEE_NAME = ""; // loaded from pa0002_personal_data by loadBootstrap() below
   function projectActualHours(pIdx){
     return WEEKS.reduce(function(a, w){
       return a + w.rows.filter(function(r){ return r.p === pIdx; }).reduce(function(x, r){ return x + rowTotal(r); }, 0);
@@ -377,240 +350,38 @@
      week navigator stays aligned: switching IT0001 is opening the sheet
      as someone assigned to that company, projects and absences included,
      not just a different input layout. */
-  var WEEKS_PT01 = [
-    { num:32, start:"20260803", submitted:true,
-      absences:[
-        {id:"ab32a", day:4, type:"Vacation", awart:"0100", hours:8, status:"approved", src:"Request 4500301"}
-      ],
-      rows:[
-        {id:601, p:0, desc:"Payroll requirements review", h:[4,4,4,4,0,0,0], origin:"Manual"},
-        {id:602, p:1, desc:"Time tracking rollout support", h:[4,4,4,4,0,0,0], origin:"Manual"}
-      ],
-      allow:[],
-      sugs:[]
-    },
-    { num:33, start:"20260810", submitted:true,
-      absences:[],
-      rows:[
-        {id:603, p:0, desc:"Payroll requirements review", h:[4,4,4,4,4,0,0], origin:"Manual"},
-        {id:604, p:2, desc:"WFM rollout kickoff prep", h:[4,4,4,4,4,0,0], origin:"Manual"}
-      ],
-      allow:[],
-      sugs:[]
-    },
-    { num:34, start:"20260817", submitted:true,
-      absences:[
-        {id:"ab34a", day:0, type:"Vacation", awart:"0100", hours:8, status:"approved", src:"Request 4500312"},
-        {id:"ab34b", day:1, type:"Vacation", awart:"0100", hours:8, status:"approved", src:"Request 4500312"},
-        {id:"ab34c", day:2, type:"Vacation", awart:"0100", hours:8, status:"approved", src:"Request 4500312"},
-        {id:"ab34d", day:3, type:"Vacation", awart:"0100", hours:8, status:"approved", src:"Request 4500312"},
-        {id:"ab34e", day:4, type:"Vacation", awart:"0100", hours:8, status:"approved", src:"Request 4500312"}
-      ],
-      rows:[],
-      allow:[],
-      sugs:[]
-    },
-    { num:35, start:"20260824", submitted:true,
-      absences:[],
-      rows:[
-        {id:96, p:0, desc:"Payroll cutover planning", h:[4,4,4,4,4,0,0], origin:"Manual"},
-        {id:97, p:1, desc:"Time tracking rollout scoping", h:[4,4,4,4,4,0,0], origin:"Manual"}
-      ],
-      allow:[],
-      sugs:[]
-    },
-    { num:36, start:"20260831", submitted:true,
-      absences:[],
-      rows:[
-        {id:101, p:0, desc:"Payroll cutover testing", h:[4,4,4,4,4,0,0], origin:"Manual"},
-        {id:102, p:1, desc:"Time tracking rollout support", h:[4,4,4,4,4,0,0], origin:"Manual"}
-      ],
-      allow:[],
-      sugs:[]
-    },
-    { num:37, start:"20260907", submitted:true,
-      absences:[
-        {id:"ab37a", day:4, type:"Vacation", awart:"0100", hours:8, status:"approved", src:"Request 4500198"}
-      ],
-      rows:[
-        {id:103, p:0, desc:"Payroll parallel run", h:[4,4,4,4,0,0,0], origin:"Manual"},
-        {id:104, p:2, desc:"WFM rollout kickoff", h:[4,4,4,4,0,0,0], origin:"Suggested"}
-      ],
-      allow:[],
-      sugs:[]
-    },
-    { num:38, start:"20260914", submitted:false,
-      absences:[
-        {id:"ab1", day:2, type:"Medical appointment", awart:"0210", hours:4, status:"approved", src:"Request 4500219"},
-        {id:"ab2", day:4, type:"Vacation", awart:"0100", hours:8, status:"approved", src:"Request 4500221"},
-        {id:"ab3", day:3, type:"Vacation", awart:"0100", hours:8, status:"pending", src:"Request 4500230"}
-      ],
-      rows:[
-        {id:1, p:0, desc:"Requirements workshop, payroll", h:[3,4,0,2,0,0,0], origin:"Manual"},
-        {id:2, p:1, desc:"Time recording solution design", h:[2,0,2,0,0,0,0], origin:"Suggested"},
-        {id:3, p:3, desc:"", h:[1,0,0,1.5,0,0,0], origin:"Manual"}
-      ],
-      allow:[
-        {id:"al1", day:0, p:0, code:"AJC_NAC", qty:1,  amount:0, note:"", by:"00104567", onBehalf:"00104567"},
-        {id:"al2", day:0, p:0, code:"KMS",     qty:86, amount:0, note:"Lisbon to Porto and back", by:"00104567", onBehalf:"00104567"},
-        {id:"al3", day:1, p:2, code:"AJC_INT", qty:1,  amount:0, note:"Spain", by:"00104567", onBehalf:"00104567"}
-      ],
-      sugs:[
+  /* WEEKS_PT01/WEEKS_PT02 are loaded from CATSDB + PA2001 by loadBootstrap()
+     below (see api/bootstrap.js), grouped back into this same per-week,
+     per-project shape the rest of the file already renders. Assistant
+     suggestions (week.sugs) have no table of their own, by design (see
+     SCHEMA.md's explicit scope boundary) — the exact same static sample as
+     before is merged in by week number once the real weeks are loaded. */
+  var WEEKS_PT01 = [];
+  var WEEKS_PT02 = [];
+  var SUGS_OVERLAY = {
+    PT01: {
+      38:[
         {id:"s1", hours:2.5, day:2, p:2, why:"3 client meetings on the calendar", conf:"hi", desc:"Rollout follow-up meetings"},
         {id:"s2", hours:1.5, day:3, p:1, why:"12 changes in the project repository", conf:"hi", desc:"Time rules configuration"},
         {id:"s3", hours:2, day:4, p:0, why:"4 tickets handled in Cloud ALM", conf:"mid", desc:"Post-testing payroll fixes"},
         {id:"s4", hours:1, day:4, p:3, why:"Block with no attributable signal", conf:"low", desc:""}
-      ]
+      ],
+      39:[{id:"s5", hours:2, day:1, p:0, why:"2 client meetings on the calendar", conf:"hi", desc:"Payroll steering follow-up"}],
+      40:[{id:"s6", hours:2, day:3, p:0, why:"3 tickets handled in Cloud ALM", conf:"hi", desc:"Payroll post-go-live fixes"}]
     },
-    { num:39, start:"20260921", submitted:false,
-      absences:[
-        {id:"ab39a", day:0, type:"Vacation", awart:"0100", hours:8, status:"pending", src:"Request 4500255"}
-      ],
-      rows:[
-        {id:605, p:0, desc:"Payroll steering follow-up", h:[4,4,2,0,0,0,0], origin:"Manual"}
-      ],
-      allow:[],
-      sugs:[
-        {id:"s5", hours:2, day:1, p:0, why:"2 client meetings on the calendar", conf:"hi", desc:"Payroll steering follow-up"}
-      ]
-    },
-    { num:40, start:"20260928", submitted:false,
-      absences:[
-        {id:"ab40a", day:1, type:"Medical appointment", awart:"0210", hours:2, status:"approved", src:"Request 4500270"}
-      ],
-      rows:[
-        {id:98, p:0, desc:"Payroll go-live support", h:[4,4,0,4,0,0,0], origin:"Manual"},
-        {id:94, p:2, desc:"WFM rollout stabilization", h:[0,0,4,0,0,0,0], origin:"Manual"}
-      ],
-      allow:[],
-      sugs:[
-        {id:"s6", hours:2, day:3, p:0, why:"3 tickets handled in Cloud ALM", conf:"hi", desc:"Payroll post-go-live fixes"}
-      ]
-    },
-    { num:41, start:"20261005", submitted:false,
-      absences:[],
-      rows:[
-        {id:95, p:1, desc:"Retail rollout wave 2 kickoff", h:[4,4,0,0,0,0,0], origin:"Manual"}
-      ],
-      allow:[],
-      sugs:[]
-    },
-    { num:42, start:"20261012", submitted:false,
-      absences:[],
-      rows:[
-        {id:607, p:0, desc:"Payroll go-live support", h:[4,4,4,4,0,0,0], origin:"Manual"},
-        {id:608, p:2, desc:"WFM rollout stabilization", h:[4,4,0,4,4,0,0], origin:"Manual"}
-      ],
-      allow:[],
-      sugs:[]
-    },
-    { num:43, start:"20261019", submitted:false,
-      absences:[],
-      rows:[
-        {id:609, p:1, desc:"Retail rollout wave 2 support", h:[4,4,0,0,0,0,0], origin:"Manual"}
-      ],
-      allow:[],
-      sugs:[]
-    },
-    { num:44, start:"20261026", submitted:false,
-      absences:[],
-      rows:[
-        {id:610, p:0, desc:"Payroll go-live support", h:[4,0,0,0,0,0,0], origin:"Manual"}
-      ],
-      allow:[],
-      sugs:[]
-    }
-  ];
-  var WEEKS_PT02 = [
-    { num:36, start:"20260831", submitted:true,
-      absences:[],
-      rows:[
-        {id:501, p:4, desc:"Elevator preventive maintenance", h:[4,4,4,4,4,0,0], origin:"Manual"},
-        {id:502, p:3, desc:"Site safety briefing", h:[1,0,1,0,0,0,0], origin:"Manual"}
-      ],
-      allow:[],
-      sugs:[]
-    },
-    { num:37, start:"20260907", submitted:true,
-      absences:[
-        {id:"pb37a", day:3, type:"Medical appointment", awart:"0210", hours:2, status:"approved", src:"Request 4500205"}
-      ],
-      rows:[
-        {id:503, p:4, desc:"HVAC filter replacement round", h:[4,4,4,0,4,0,0], origin:"Manual"},
-        {id:504, p:4, desc:"Fire safety systems check", h:[0,0,0,3,0,0,0], origin:"Suggested"}
-      ],
-      allow:[],
-      sugs:[]
-    },
-    { num:38, start:"20260914", submitted:false,
-      absences:[
-        {id:"pb1", day:2, type:"Medical appointment", awart:"0210", hours:4, status:"approved", src:"Request 4500219"},
-        {id:"pb2", day:4, type:"Vacation", awart:"0100", hours:8, status:"approved", src:"Request 4500221"},
-        {id:"pb3", day:3, type:"Vacation", awart:"0100", hours:8, status:"pending", src:"Request 4500230"}
-      ],
-      rows:[
-        {id:511, p:4, desc:"Boiler room inspection", h:[3,4,0,2,0,0,0], origin:"Manual"},
-        {id:512, p:4, desc:"Elevator call-out repair", h:[2,0,3,0,0,0,0], origin:"Suggested"},
-        {id:513, p:3, desc:"", h:[1,0,0,1.5,0,0,0], origin:"Manual"}
-      ],
-      allow:[
-        {id:"pal1", day:0, p:4, code:"TURNO", qty:1,  amount:0, note:"", by:"00104567", onBehalf:"00104567"},
-        {id:"pal2", day:0, p:4, code:"KMS",   qty:42, amount:0, note:"Depot to hospital campus and back", by:"00104567", onBehalf:"00104567"}
-      ],
-      sugs:[
+    PT02: {
+      38:[
         {id:"ps1", hours:2.5, day:2, p:4, why:"3 work orders closed in the maintenance log", conf:"hi", desc:"Follow-up repairs"},
         {id:"ps2", hours:1.5, day:3, p:4, why:"12 changes in the maintenance ticket system", conf:"hi", desc:"HVAC configuration"},
         {id:"ps3", hours:2, day:4, p:4, why:"4 tickets handled in Cloud ALM", conf:"mid", desc:"Post-inspection fixes"},
         {id:"ps4", hours:1, day:4, p:3, why:"Block with no attributable signal", conf:"low", desc:""}
-      ]
-    },
-    { num:39, start:"20260921", submitted:false,
-      absences:[
-        {id:"pb39a", day:0, type:"Vacation", awart:"0100", hours:8, status:"pending", src:"Request 4500255"}
       ],
-      rows:[],
-      allow:[],
-      sugs:[
-        {id:"ps5", hours:2, day:1, p:4, why:"2 work orders on the maintenance calendar", conf:"hi", desc:"Facilities steering follow-up"}
-      ]
-    },
-    { num:40, start:"20260928", submitted:false,
-      absences:[
-        {id:"pb40a", day:2, type:"Vacation", awart:"0100", hours:8, status:"approved", src:"Request 4500281"}
-      ],
-      rows:[
-        {id:514, p:4, desc:"Elevator preventive maintenance", h:[4,4,0,4,4,0,0], origin:"Manual"},
-        {id:515, p:5, desc:"Terminal HVAC inspection round", h:[4,4,4,4,0,0,0], origin:"Manual"}
-      ],
-      allow:[
-        {id:"pal3", day:0, p:5, code:"TURNO", qty:1, amount:0, note:"", by:"00104567", onBehalf:"00104567"}
-      ],
-      sugs:[
-        {id:"ps6", hours:2, day:1, p:5, why:"3 work orders closed in the maintenance log", conf:"hi", desc:"Follow-up repairs"}
-      ]
-    },
-    { num:41, start:"20261005", submitted:false,
-      absences:[],
-      rows:[
-        {id:516, p:4, desc:"Boiler room inspection", h:[3,0,3,0,0,0,0], origin:"Manual"},
-        {id:517, p:5, desc:"Baggage handling systems check", h:[0,4,4,0,0,0,0], origin:"Suggested"}
-      ],
-      allow:[],
-      sugs:[
-        {id:"ps7", hours:1.5, day:3, p:5, why:"12 changes in the maintenance ticket system", conf:"mid", desc:"Terminal configuration"}
-      ]
+      39:[{id:"ps5", hours:2, day:1, p:4, why:"2 work orders on the maintenance calendar", conf:"hi", desc:"Facilities steering follow-up"}],
+      40:[{id:"ps6", hours:2, day:1, p:5, why:"3 work orders closed in the maintenance log", conf:"hi", desc:"Follow-up repairs"}],
+      41:[{id:"ps7", hours:1.5, day:3, p:5, why:"12 changes in the maintenance ticket system", conf:"mid", desc:"Terminal configuration"}]
     }
-  ];
-  /* The PT02 sample rows only ever specified a duration; Z_BSRV always
-     needs a start and end too, so back-fill one for every week here,
-     once, rather than leaving it to whichever week happens to be loaded
-     when seedClock() next runs. */
-  WEEKS_PT02.forEach(function(w){ seedClockRows(w.rows); });
-  var WEEKS = WEEKS_PT01;
-  var weekIdx = 6; // week 38, the default landing week (index shifts whenever a week is added before it)
-  var ABSENCES = WEEKS[weekIdx].absences;
-  WORKDATES = datesFor(WEEKS[weekIdx].start);
-  DAYS = daysFor(WORKDATES);
+  };
+  var WEEKS = []; var weekIdx = 0; var ABSENCES = [];
 
   function absOn(day, status){
     return ABSENCES.filter(function(a){ return a.day === day && (!status || a.status === status); });
@@ -1963,77 +1734,13 @@
   /* Sofia's (PT01, Consulting) and Marco's (PT02, Building Solutions) own
      approval queues - swapped into state.approvals on company switch, the
      same way WEEKS is, so the Approval screen reflects whichever company
-     IT0001 currently reads instead of always showing Consulting. */
-  var APPROVALS_PT01 = [
-    {who:"Ana Ferreira", role:"Senior consultant", proj:"BNK-2026", tot:40, inproj:36, dev:0, warn:0, sel:false, days:[8,8,8,8,8]},
-    {who:"Bruno Matos", role:"Consultant", proj:"RTL-TT", tot:38.5, inproj:34, dev:-1.5, warn:0, sel:false, days:[8,8,8,8,6.5]},
-    {who:"Carla Nunes", role:"Consultant", proj:"AER-WFM", tot:40, inproj:40, dev:0, warn:0, sel:false, days:[8,8,8,8,8]},
-    {who:"Diogo Sousa", role:"Junior consultant", proj:"BNK-2026", tot:37, inproj:30, dev:-3, warn:0, sel:false, days:[8,8,8,8,5]},
-    {who:"Eva Lopes", role:"Architect", proj:"RTL-TT", tot:40, inproj:40, dev:0, warn:1, sel:false, note:"Pending leave request overlaps recorded hours", days:[8,8,8,8,8]},
-    {who:"Filipe Reis", role:"Consultant", proj:"AER-WFM", tot:24, inproj:18, dev:-16, warn:1, sel:false, note:"Two empty working days", days:[8,8,0,8,0]}
-  ];
-  var APPROVALS_PT02 = [
-    {who:"Nuno Dias", role:"Technician", proj:"HSP-FAC", tot:40, inproj:40, dev:0, warn:0, sel:false, days:[8,8,8,8,8]},
-    {who:"Hélder Rocha", role:"Technician", proj:"HSP-FAC", tot:18, inproj:18, dev:-12, warn:0, sel:false, days:[0,0,6,6,6]},
-    {who:"Luís Teixeira", role:"Technician", proj:"HSP-FAC", tot:24, inproj:24, dev:-8, warn:0, sel:false, days:[8,8,8,0,0]},
-    {who:"Ana Pires", role:"Technician", proj:"AER-FAC", tot:16, inproj:16, dev:-16, warn:0, sel:false, days:[8,8,0,0,0]},
-    {who:"Hugo Matos", role:"Technician", proj:"HSP-FAC", tot:24, inproj:24, dev:-8, warn:1, sel:false, note:"Pending leave request overlaps recorded hours", days:[8,0,8,8,0]},
-    {who:"Carla Sousa", role:"Senior technician", proj:"AER-FAC", tot:16, inproj:16, dev:-16, warn:1, sel:false, note:"Two empty working days", days:[0,8,8,0,0]}
-  ];
-  var state = {
-    lang: (function(){
-      try{
-        var saved = localStorage.getItem("vesiLang");
-        return I18N[saved] ? saved : "en";
-      }catch(e){ return "en"; }
-    })(),
-    submitted: WEEKS[weekIdx].submitted,
-    /* True whenever there's an edit (to any week, hours or a status
-       change) not yet confirmed with Save: set on every hour-cell edit,
-       template/suggestion/quick-add/chat entry, and on Submit itself
-       (submitting changes the week's status, which also needs saving).
-       Only Save clears it - navigating to a different week doesn't,
-       since the pending work isn't tied to whichever week is on screen. */
-    needsSave: false,
-    privateMode:false,
-    rows: WEEKS[weekIdx].rows,
-    allow: WEEKS[weekIdx].allow,
-    sugs: WEEKS[weekIdx].sugs,
-    deviationNote: WEEKS[weekIdx].deviationNote || "",
-    leader: "RN",
-    staged: {},
-    stagedAllow: [],
-    massLog: [],
-    /* Same idea as needsSave, but for the Team screen's own leader-side
-       action, kept separate so one person's pending work never shows as
-       "unsaved" on someone else's screen: "Save staged entries"/"Save
-       staged allowances" only move data from staged into massLog (the
-       "Recorded on behalf" log) - not yet reflected in the database, that
-       still needs the header Save. Bonus is excluded on purpose, it's
-       recorded and approved in the same click, there's nothing staged. */
-    teamNeedsSave: false,
-    /* massLog is append-only (see the beforeLog = massLog.length pattern
-       already used for the assistant's own flows below), so "everything
-       from this index on is still unsaved" is enough to mark exactly
-       which recorded-but-not-saved hours entries a cell should highlight,
-       even once they're no longer in state.staged - a mass fill that goes
-       straight to massLog (the assistant's team fill does, it never
-       leaves anything sitting in staged) would otherwise show no marker
-       at all once it's recorded. */
-    teamSavedThrough: 0,
-    /* pure display state, not part of the timesheet data: which mass-entry
-       tab is showing, and whether the person has manually opened/closed
-       Suggestions this session (null = follow the automatic empty/non-empty
-       guess) */
-    teamTab: "hours",
-    sugManualOpen: null,
-    allowManualOpen: null,
-    /* which top-level screen is showing right now: "semana" (My week),
-       "team", "aprov" or "cats" - lets the assistant tell a personal
-       request from a team one when the wording alone is ambiguous */
-    screen: "semana",
-    approvals: APPROVALS_PT01
-  };
+     IT0001 currently reads instead of always showing Consulting. Loaded
+     from ztime_approval by loadBootstrap() below. */
+  var APPROVALS_PT01 = []; var APPROVALS_PT02 = [];
+  /* Built in loadBootstrap() below, once WEEKS/weekIdx/APPROVALS_PT01 exist -
+     every field here used to read a mock literal directly; now it reads
+     whatever loadBootstrap() just assigned, same shape, same defaults. */
+  var state = {lang:"en", rows:[], allow:[], sugs:[], approvals:[], staged:{}, stagedAllow:[], massLog:[]}; // placeholder; applyBootstrapData() below replaces this wholesale once the real data loads
 
   var $ = function(id){ return document.getElementById(id); };
   var nextId = 100;
@@ -3989,6 +3696,43 @@
      teamNeedsSave - the step that actually reflects everything already
      recorded on behalf of the team in the database. One safe click that
      always finishes the job, whichever tab it was staged from. */
+  /* Persists massLog entries not yet written to the database (everything
+     from teamSavedThrough on), grouped by project since /api/team-entry
+     takes one receiver (WBS or direct cost center) per call. Z_BSRV's own
+     start/end (beg/end on an hours entry) isn't sent - only the computed
+     duration is - the same simplification the personal Save already makes
+     (see hoursForApi above); BEGUZ/ENDUZ aren't persisted in this pass. */
+  function persistMassLogEntries(entries){
+    if(!entries.length) return Promise.resolve();
+    var byProject = {};
+    entries.forEach(function(e){ (byProject[e.p] = byProject[e.p] || []).push(e); });
+    var calls = Object.keys(byProject).map(function(pIdxStr){
+      var pr = PROJECTS[+pIdxStr];
+      var group = byProject[pIdxStr];
+      var hoursEntries = group.filter(function(e){ return e.kind === "hours"; }).map(function(e){
+        return {pernr: e.pernr, workdate: isoDash(e.date), hours: e.hours, desc: null, origin: "Manual"};
+      });
+      var allowEntries = group.filter(function(e){ return e.kind === "allowance" || e.kind === "bonus"; }).map(function(e){
+        var wtype = wt(e.code);
+        return {
+          pernr: e.pernr, workdate: isoDash(e.date),
+          lgart: wtype.lgart,
+          qty: wtype.amount ? null : e.qty,
+          amount: wtype.amount ? e.amount : null,
+          note: e.note || null
+        };
+      });
+      return apiPost("/api/team-entry", {
+        actingAsPernr: state.leader,
+        pspid: pr.wbs || null,
+        rkostl: pr.wbs ? null : directKostlFor(),
+        lstar: pr.sap.lstar,
+        entries: hoursEntries,
+        allow: allowEntries
+      });
+    });
+    return Promise.all(calls);
+  }
   function saveTeamAll(){
     var hoursSaved = saveMass(null, true);
     var allowSaved = saveMassAllow(null, true);
@@ -3996,10 +3740,15 @@
       toast(t("toast_nothing_to_save"));
       return;
     }
-    state.teamNeedsSave = false;
-    state.teamSavedThrough = state.massLog.length;
-    renderTeam();
-    toast(t("toast_changes_saved"));
+    var newEntries = state.massLog.slice(state.teamSavedThrough);
+    persistMassLogEntries(newEntries).then(function(){
+      state.teamNeedsSave = false;
+      state.teamSavedThrough = state.massLog.length;
+      renderTeam();
+      toast(t("toast_changes_saved"));
+    }).catch(function(err){
+      toast("Save failed: " + err.message);
+    });
   }
   function renderMassAllowList(){
     var box = $("mAllowList");
@@ -4996,10 +4745,85 @@
     $("vCal").setAttribute("aria-pressed", grid ? "false" : "true");
     if($("addRow")) $("addRow").hidden = !grid;
   }
+  function isoDash(yyyymmdd){ return yyyymmdd.slice(0,4) + "-" + yyyymmdd.slice(4,6) + "-" + yyyymmdd.slice(6,8); }
+  /* The real receiver for a direct-cost-center booking (no WBS, e.g.
+     AXI-INT) depends on which company's week this is - PT4010 for PT01,
+     PT4020 for PT02 - never the fixed display-only value PROJECTS[].sap
+     carries (see api/bootstrap.js's own comment on that simplification). */
+  function directKostlFor(){ return IT0001.bukrs === "PT02" ? "PT4020" : "PT4010"; }
+  function apiPost(url, body){
+    return fetch(url, {method:"POST", headers:{"Content-Type":"application/json"}, body:JSON.stringify(body)})
+      .then(function(res){
+        if(res.ok) return res.json();
+        return res.json().catch(function(){ return {}; }).then(function(e){ throw new Error(e.error || ("HTTP " + res.status)); });
+      });
+  }
+  function hoursForApi(w){
+    var out = [];
+    w.rows.forEach(function(r){
+      var pr = PROJECTS[r.p];
+      r.h.forEach(function(hours, day){
+        if(!hours) return;
+        out.push({
+          workdate: isoDash(datesFor(w.start)[day]),
+          pspid: pr.wbs || null,
+          rkostl: pr.wbs ? null : directKostlFor(),
+          lstar: pr.sap.lstar,
+          hours: hours,
+          desc: r.desc || null,
+          origin: r.origin === "Copied" ? "Manual" : (r.origin || "Manual")
+        });
+      });
+    });
+    return out;
+  }
+  function allowForApi(w){
+    return (w.allow || []).map(function(a){
+      var pr = PROJECTS[a.p];
+      var wtype = wt(a.code);
+      return {
+        workdate: isoDash(datesFor(w.start)[a.day]),
+        pspid: pr.wbs || null,
+        rkostl: pr.wbs ? null : directKostlFor(),
+        lgart: wtype.lgart,
+        qty: wtype.amount ? null : a.qty,
+        amount: wtype.amount ? a.amount : null,
+        note: a.note || null
+      };
+    });
+  }
+  /* The single place every save (weekly or monthly) actually reaches the
+     database: POST /api/timesheet replaces this week's own hours and
+     allowance rows, then - only if Submit already flagged this week
+     in-memory - POST /api/timesheet-submit releases it, same "Save
+     required after Submit" rule the UI already enforced locally.
+     A monthly Save touches every week in the active month (activeMonthWeeks),
+     including ones already submitted in an earlier session - the database
+     correctly refuses to rewrite those (409 week_locked). There's nothing
+     to write for an unchanged, already-locked week anyway (the UI already
+     disables editing it), so that specific conflict is a no-op here, not
+     a failure; any other error still is. */
+  function saveWeekToApi(w){
+    var bukrs = IT0001.bukrs;
+    return apiPost("/api/timesheet", {pernr: PERNR, weekStart: isoDash(w.start), bukrs: bukrs, hours: hoursForApi(w), allow: allowForApi(w)})
+      .then(function(){
+        if(w.submitted) return apiPost("/api/timesheet-submit", {pernr: PERNR, weekStart: isoDash(w.start), bukrs: bukrs});
+      })
+      .catch(function(err){
+        if(err.message === "week_locked") return;
+        throw err;
+      });
+  }
   function saveChanges(){
-    state.needsSave = false;
-    render();
-    toast(t("toast_changes_saved"));
+    saveCurrentWeek();
+    var weeks = isMonthly() ? activeMonthWeeks() : [WEEKS[weekIdx]];
+    Promise.all(weeks.map(saveWeekToApi)).then(function(){
+      state.needsSave = false;
+      render();
+      toast(t("toast_changes_saved"));
+    }).catch(function(err){
+      toast("Save failed: " + err.message);
+    });
   }
   /* A second Save/Submit pair at the foot of the grid, so a long week or
      month doesn't force a scroll back to the top just to save or submit
@@ -5056,10 +4880,18 @@
     renderApprovals();
   };
   $("apApprove").onclick = function(){
-    var n = 0;
-    state.approvals.forEach(function(a){ if(a.sel){ a.approved = true; a.sel = false; n++; } });
-    renderApprovals();
-    toast(t("toast_timesheets_approved", {n: n}));
+    var picked = state.approvals.filter(function(a){ return a.sel; });
+    if(!picked.length) return;
+    /* Sofia/Patrícia (the approver shown in updateApproverChrome) are a
+       display-only identity, not a seeded employee - PERNR stands in as
+       the approver of record so the write satisfies the real FK. */
+    apiPost("/api/approvals", {ids: picked.map(function(a){ return a.approvalId; }), approverPernr: PERNR})
+      .then(function(){
+        picked.forEach(function(a){ a.approved = true; a.sel = false; });
+        renderApprovals();
+        toast(t("toast_timesheets_approved", {n: picked.length}));
+      })
+      .catch(function(err){ toast("Approve failed: " + err.message); });
   };
 
   Array.prototype.forEach.call(document.querySelectorAll(".nav button"), function(b){
@@ -6265,10 +6097,14 @@
       botSay("bot",t("bot_confirm_approve_all", {n: clean.length}), botCard(
         clean.map(function(a){ return [a.who, fmt(a.tot) + " h"]; }),
         t("btn_approve_all"), function(){
-          clean.forEach(function(a){ a.approved = true; a.sel = false; });
-          renderApprovals();
-          botSay("bot", t("bot_approved_all_msg", {n: clean.length}));
-          botChips([t("chip_help")]);
+          apiPost("/api/approvals", {ids: clean.map(function(a){ return a.approvalId; }), approverPernr: PERNR})
+            .then(function(){
+              clean.forEach(function(a){ a.approved = true; a.sel = false; });
+              renderApprovals();
+              botSay("bot", t("bot_approved_all_msg", {n: clean.length}));
+              botChips([t("chip_help")]);
+            })
+            .catch(function(err){ botSay("bot", "Approve failed: " + err.message); });
         }
       ));
       return;
@@ -6282,10 +6118,14 @@
     botSay("bot",t("bot_confirm_approve_one", {name: a.who}), botCard([
       [t("label_project"), a.proj], [t("th_total"), fmt(a.tot) + " h"], [t("label_in_project"), fmt(a.inproj) + " h"]
     ], t("btn_approve"), function(){
-      a.approved = true; a.sel = false;
-      renderApprovals();
-      botSay("bot", t("bot_approved_one_msg", {name: a.who}));
-      botChips([t("chip_help")]);
+      apiPost("/api/approvals", {ids: [a.approvalId], approverPernr: PERNR})
+        .then(function(){
+          a.approved = true; a.sel = false;
+          renderApprovals();
+          botSay("bot", t("bot_approved_one_msg", {name: a.who}));
+          botChips([t("chip_help")]);
+        })
+        .catch(function(err){ botSay("bot", "Approve failed: " + err.message); });
     }));
   }
 
@@ -6445,7 +6285,7 @@
     }
     var ls = $("leadSel");
     if(ls){
-      renderLeaderOptions();
+      // Populated once loadBootstrap's fetch resolves (needs LEADERS), not here.
       ls.onchange = function(){
         state.leader = ls.value;
         var pj = $("mProj"); if(pj) pj.dataset.for = "";
@@ -6532,7 +6372,111 @@
   if($("ttAllow")) $("ttAllow").onclick = function(){ state.teamTab = "allow"; renderTeam(); };
   if($("ttBonus")) $("ttBonus").onclick = function(){ state.teamTab = "bonus"; renderTeam(); };
 
-  applyLocaleArrays();
-  applyI18n();
-  render();
+  /* ---------- bootstrap: load everything from the real database ----------
+     Replaces the literal mock arrays this file used to declare (PROJECTS,
+     COMPANIES, PROFILES/ZTIME_COMPANY_CFG, WAGETYPES, LEADERS, TEAM,
+     WEEKS_PT01/PT02, APPROVALS_PT01/PT02) with one fetch to
+     GET /api/bootstrap, shaped server-side to match those exact literals
+     (see api/bootstrap.js) so everything below this function - every
+     render/validate/save/assistant function in the file - runs completely
+     unchanged once it does. */
+  function applyBootstrapData(data){
+    PROJECTS = data.projects;
+    COMPANIES = data.companies;
+    WAGETYPES = data.wageTypes;
+    PROFILES = data.profiles;
+    ZTIME_COMPANY_CFG = Object.keys(data.companyProfileMap).map(function(bukrs){
+      return {bukrs:bukrs, begda:"20200101", endda:"99991231", profile:data.companyProfileMap[bukrs]};
+    });
+    EMPLOYEE_NAME = data.employeeName;
+    DAYCAP = data.dailyHours;
+    IT0001.bukrs = data.employeeBukrs || "PT01";
+
+    LEADERS = [].concat(
+      data.leadersByCompany.PT01.map(function(l){ return {id:l.pernr, name:l.name, label:l.label, projs:l.projs, bukrs:"PT01"}; }),
+      data.leadersByCompany.PT02.map(function(l){ return {id:l.pernr, name:l.name, label:l.label, projs:l.projs, bukrs:"PT02"}; })
+    );
+    TEAM = data.team.map(function(m){
+      var overlay = TEAM_SAMPLE_OVERLAY[m.pernr] || {};
+      return Object.assign({abs:{}, already:[0,0,0,0,0,0,0]}, m, overlay);
+    });
+
+    function withSugs(weeks, bukrs){
+      weeks.forEach(function(w){ w.sugs = (SUGS_OVERLAY[bukrs] && SUGS_OVERLAY[bukrs][w.num]) || []; });
+      return weeks;
+    }
+    WEEKS_PT01 = withSugs(data.weeksByCompany.PT01, "PT01");
+    WEEKS_PT02 = withSugs(data.weeksByCompany.PT02, "PT02");
+    /* The PT02 sample rows only ever specified a duration; Z_BSRV always
+       needs a start and end too, so back-fill one for every week here,
+       once, rather than leaving it to whichever week happens to be loaded
+       when seedClock() next runs. */
+    WEEKS_PT02.forEach(function(w){ seedClockRows(w.rows); });
+
+    APPROVALS_PT01 = data.approvalsByCompany.PT01;
+    APPROVALS_PT02 = data.approvalsByCompany.PT02;
+
+    WEEKS = WEEKS_PT01;
+    weekIdx = WEEKS.reduce(function(found,w,i){ return w.num === 38 ? i : found; }, -1);
+    if(weekIdx < 0) weekIdx = 6; // fallback if week 38 ever stops existing
+    ABSENCES = WEEKS[weekIdx].absences;
+    WORKDATES = datesFor(WEEKS[weekIdx].start);
+    DAYS = daysFor(WORKDATES);
+
+    state = {
+      lang: (function(){
+        try{
+          var saved = localStorage.getItem("vesiLang");
+          return I18N[saved] ? saved : "en";
+        }catch(e){ return "en"; }
+      })(),
+      submitted: WEEKS[weekIdx].submitted,
+      needsSave: false,
+      privateMode:false,
+      rows: WEEKS[weekIdx].rows,
+      allow: WEEKS[weekIdx].allow,
+      sugs: WEEKS[weekIdx].sugs,
+      deviationNote: WEEKS[weekIdx].deviationNote || "",
+      /* Default landing leader, same as the original mock's "RN" (Ricardo
+         Nunes, RTL-TT + AXI-INT) - falls back to whoever's first if his
+         pernr ever stops being a project manager. */
+      leader: (LEADERS.some(function(l){ return l.id === "00104506"; }) ? "00104506" : (LEADERS[0] && LEADERS[0].id)) || null,
+      staged: {},
+      stagedAllow: [],
+      massLog: [],
+      teamNeedsSave: false,
+      teamSavedThrough: 0,
+      teamTab: "hours",
+      sugManualOpen: null,
+      allowManualOpen: null,
+      screen: "semana",
+      approvals: APPROVALS_PT01
+    };
+  }
+
+  function bootFailed(err){
+    var el = document.getElementById("bootError");
+    if(el){
+      el.hidden = false;
+      el.textContent = "Could not load the timesheet from the database. " + (err && err.message ? err.message : "Please retry.");
+    }
+    if(typeof console !== "undefined") console.error("bootstrap failed", err);
+  }
+
+  fetch("/api/bootstrap?pernr=" + encodeURIComponent(PERNR))
+    .then(function(res){
+      if(!res.ok) throw new Error("HTTP " + res.status);
+      return res.json();
+    })
+    .then(function(data){
+      applyBootstrapData(data);
+      if($("coSel")) $("coSel").value = IT0001.bukrs;
+      renderLeaderOptions();
+      applyLocaleArrays();
+      applyI18n();
+      render();
+      var loading = document.getElementById("bootLoading");
+      if(loading) loading.remove();
+    })
+    .catch(bootFailed);
 })();

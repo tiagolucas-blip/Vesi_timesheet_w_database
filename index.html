@@ -15,6 +15,12 @@
 </style>
 </head>
 <body>
+<div id="bootLoading" style="position:fixed; inset:0; z-index:9999; display:flex; align-items:center; justify-content:center; background:#fff; font:14px/1.5 system-ui, sans-serif; color:#444">
+  <div style="text-align:center">
+    <div>Loading timesheet…</div>
+    <div id="bootError" hidden style="margin-top:8px; color:#b00020; max-width:360px"></div>
+  </div>
+</div>
 <header class="shellbar">
   <img class="orglogo" src="assets/vinci-energies-logo.png" alt="Vinci Energies">
   <div class="brand"><strong data-i18n="brand_title">Time Recording</strong><span data-i18n="brand_subtitle">Fiori Prototype</span></div>

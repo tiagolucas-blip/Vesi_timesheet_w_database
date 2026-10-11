@@ -1,23 +1,39 @@
 /**
- * GET  /api/timesheet?pernr=00104567&start=2026-09-14
+ * GET  /api/timesheet?pernr=00104567&start=2026-09-14&bukrs=PT01
  *   One person's week (Monday start), straight off CATSDB/PA2001: hours
  *   rows, allowance/bonus rows and absences overlapping the week, plus a
  *   derived "submitted" flag. Replaces app.js's WEEKS_PT01/WEEKS_PT02
  *   entries and ABSENCES for that week.
  *
- * POST /api/timesheet  { pernr, weekStart, hours:[...], allow:[...] }
+ * POST /api/timesheet  { pernr, weekStart, bukrs, hours:[...], allow:[...] }
  *   Replaces the week's own hours+allowance rows (Save). Refuses if the
  *   week is already submitted/approved/transferred — "Save obrigatório
  *   antes do Submit" still means the DB, not just the UI, protects a
  *   released week from a stray save.
+ *
+ * bukrs is required on both: PT01 and PT02 weeks can share the exact same
+ * calendar dates (same person, two company "views" of their own
+ * timesheet — see SCHEMA.md/api/bootstrap.js), so every query here is
+ * scoped to rows whose receiver actually belongs to that company — a WBS
+ * element under a project with that bukrs, or a direct cost-center
+ * booking using that company's own cost center — never by date range
+ * alone. Saving one company's week must never touch the other's rows for
+ * the same dates.
  */
 import { query, withTransaction, weekDates, sendError } from "./_db.js";
 
 const LOCKED_STATUSES = ["SUBMITTED", "APPROVED", "TRANSFERRED"];
+const COMPANY_KOSTL = { PT01: "PT4010", PT02: "PT4020" };
 
-async function getWeek(pernr, weekStart) {
+function receiverScopeSql(paramIndexBukrs, paramIndexKostl) {
+  return `(w.pspid IN (SELECT pspid FROM proj_project_definition WHERE bukrs = $${paramIndexBukrs})
+           OR TRIM(c.rkostl) = $${paramIndexKostl})`;
+}
+
+async function getWeek(pernr, weekStart, bukrs) {
   const dates = weekDates(weekStart);
   const [monday, sunday] = [dates[0], dates[6]];
+  const kostl = COMPANY_KOSTL[bukrs];
 
   const hours = await query(
     `SELECT c.catsdb_id, c.workdate, c.posid AS wbs, w.pspid, p.post1 AS pspid_name,
@@ -29,8 +45,9 @@ async function getWeek(pernr, weekStart) {
      LEFT JOIN csks_cost_center ck ON ck.kostl = c.rkostl
      WHERE c.pernr = $1 AND c.workdate BETWEEN $2 AND $3
        AND c.lgart IS NULL AND c.awart IS NULL
+       AND ${receiverScopeSql(4, 5)}
      ORDER BY c.workdate, c.catsdb_id`,
-    [pernr, monday, sunday]
+    [pernr, monday, sunday, bukrs, kostl]
   );
 
   const allow = await query(
@@ -43,8 +60,9 @@ async function getWeek(pernr, weekStart) {
      LEFT JOIN prps_wbs_element w2 ON w2.posid = c.posid
      LEFT JOIN proj_project_definition p ON p.pspid = w2.pspid
      WHERE c.pernr = $1 AND c.workdate BETWEEN $2 AND $3 AND c.lgart IS NOT NULL
+       AND (w2.pspid IN (SELECT pspid FROM proj_project_definition WHERE bukrs = $4) OR TRIM(c.rkostl) = $5)
      ORDER BY c.workdate, c.catsdb_id`,
-    [pernr, monday, sunday]
+    [pernr, monday, sunday, bukrs, kostl]
   );
 
   const absences = await query(
@@ -71,14 +89,14 @@ async function getWeek(pernr, weekStart) {
 }
 
 export default async function handler(req, res) {
-  const { pernr, start } = req.query;
+  const { pernr, start, bukrs } = req.query;
 
   if (req.method === "GET") {
-    if (!pernr || !start) {
-      return sendError(res, 400, "pernr_and_start_required");
+    if (!pernr || !start || !bukrs) {
+      return sendError(res, 400, "pernr_start_and_bukrs_required");
     }
     try {
-      res.status(200).json(await getWeek(pernr, start));
+      res.status(200).json(await getWeek(pernr, start, bukrs));
     } catch (err) {
       sendError(res, 500, "query_failed", err.message);
     }
@@ -87,26 +105,35 @@ export default async function handler(req, res) {
 
   if (req.method === "POST") {
     const body = req.body || {};
-    const { pernr: bodyPernr, weekStart, hours = [], allow = [] } = body;
-    if (!bodyPernr || !weekStart) {
-      return sendError(res, 400, "pernr_and_weekStart_required");
+    const { pernr: bodyPernr, weekStart, bukrs: bodyBukrs, hours = [], allow = [] } = body;
+    if (!bodyPernr || !weekStart || !bodyBukrs) {
+      return sendError(res, 400, "pernr_weekStart_and_bukrs_required");
     }
     const dates = weekDates(weekStart);
     const [monday, sunday] = [dates[0], dates[6]];
+    const kostl = COMPANY_KOSTL[bodyBukrs];
     try {
       await withTransaction(async (client) => {
         const existing = await client.query(
-          `SELECT status FROM catsdb WHERE pernr = $1 AND workdate BETWEEN $2 AND $3`,
-          [bodyPernr, monday, sunday]
+          `SELECT c.status FROM catsdb c
+           LEFT JOIN prps_wbs_element w ON w.posid = c.posid
+           WHERE c.pernr = $1 AND c.workdate BETWEEN $2 AND $3
+             AND ${receiverScopeSql(4, 5)}`,
+          [bodyPernr, monday, sunday, bodyBukrs, kostl]
         );
         if (existing.rows.some((r) => LOCKED_STATUSES.includes(r.status))) {
           throw Object.assign(new Error("week_locked"), { httpStatus: 409 });
         }
-        await client.query(`DELETE FROM catsdb WHERE pernr = $1 AND workdate BETWEEN $2 AND $3`, [
-          bodyPernr,
-          monday,
-          sunday,
-        ]);
+        await client.query(
+          `DELETE FROM catsdb c
+           USING (SELECT catsdb_id FROM catsdb c2
+                  LEFT JOIN prps_wbs_element w ON w.posid = c2.posid
+                  WHERE c2.pernr = $1 AND c2.workdate BETWEEN $2 AND $3
+                    AND (w.pspid IN (SELECT pspid FROM proj_project_definition WHERE bukrs = $4) OR TRIM(c2.rkostl) = $5)
+                 ) del
+           WHERE c.catsdb_id = del.catsdb_id`,
+          [bodyPernr, monday, sunday, bodyBukrs, kostl]
+        );
         for (const r of hours) {
           if (!r.hours) continue;
           await client.query(
@@ -123,7 +150,7 @@ export default async function handler(req, res) {
           );
         }
       });
-      res.status(200).json(await getWeek(bodyPernr, weekStart));
+      res.status(200).json(await getWeek(bodyPernr, weekStart, bodyBukrs));
     } catch (err) {
       if (err.httpStatus === 409) return sendError(res, 409, "week_locked");
       sendError(res, 500, "query_failed", err.message);

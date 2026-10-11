@@ -349,12 +349,20 @@ INSERT INTO catsdb (pernr, workdate, posid, rkostl, lgart, anzhl, catsamount, lo
   ('00104567', '2026-09-28', 'AER-FAC.2.1', NULL, '1500', 1, NULL, NULL, 'SAVED', 'Manual', '00104567', '00104567');
 
 -- Absences (PA2001), self-service user, all weeks both companies. Weeks 38
--- and 39 reuse the exact same sample request numbers in both companies'
--- mock data (same person, same calendar) — deduplicated by request_number
--- so each real leave request produces exactly one row.
+-- and 39 reuse the exact same sample request numbers for the exact same
+-- dates in both companies' mock data (same person, same calendar) —
+-- deduplicated by (request_number, date) so each real leave request/day
+-- produces exactly one row. A single request spanning several distinct
+-- days (e.g. week 34's 5-day vacation) keeps one row per day: dedup is
+-- by date too, not request_number alone, or 4 of those 5 days would be
+-- wrongly dropped as "duplicates" of each other.
 INSERT INTO pa2001_absences (pernr, awart, begda, endda, hours, status, request_number) VALUES
   ('00104567', '0100', '2026-08-07', '2026-08-07', 8, 'approved', '4500301'),
   ('00104567', '0100', '2026-08-17', '2026-08-17', 8, 'approved', '4500312'),
+  ('00104567', '0100', '2026-08-18', '2026-08-18', 8, 'approved', '4500312'),
+  ('00104567', '0100', '2026-08-19', '2026-08-19', 8, 'approved', '4500312'),
+  ('00104567', '0100', '2026-08-20', '2026-08-20', 8, 'approved', '4500312'),
+  ('00104567', '0100', '2026-08-21', '2026-08-21', 8, 'approved', '4500312'),
   ('00104567', '0100', '2026-09-11', '2026-09-11', 8, 'approved', '4500198'),
   ('00104567', '0210', '2026-09-16', '2026-09-16', 4, 'approved', '4500219'),
   ('00104567', '0100', '2026-09-18', '2026-09-18', 8, 'approved', '4500221'),

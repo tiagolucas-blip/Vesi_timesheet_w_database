@@ -26,10 +26,15 @@ export default async function handler(req, res) {
 
   try {
     await withTransaction(async (client) => {
+      // Scoped to this same receiver (posid/rkostl), not just pernr+date:
+      // PT01 and PT02 weeks can share calendar dates for the same person
+      // (see SCHEMA.md), so a lock on an unrelated project/company booking
+      // that day must never block this one.
       const locked = await client.query(
         `SELECT pernr, workdate FROM catsdb
-         WHERE pernr = ANY($1) AND workdate = ANY($2) AND status = ANY($3)`,
-        [pernrs, dates, LOCKED_STATUSES]
+         WHERE pernr = ANY($1) AND workdate = ANY($2) AND status = ANY($3)
+           AND posid IS NOT DISTINCT FROM $4 AND TRIM(rkostl) IS NOT DISTINCT FROM $5`,
+        [pernrs, dates, LOCKED_STATUSES, pspid || null, rkostl || null]
       );
       if (locked.rows.length) {
         throw Object.assign(new Error("day_locked"), { httpStatus: 409, rows: locked.rows });
