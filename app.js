@@ -1,0 +1,6538 @@
+(function(){
+  "use strict";
+
+  var DAYS = [];
+  /* bukrs ties a project to the company it belongs to, so staffing stays
+     thematically consistent: a payroll or WFM engagement is consulting
+     work (PT01), a facilities engagement is building solutions (PT02).
+     null means shared, open internal work, not tied to either theme. */
+  var PROJECTS = [
+    {code:"BNK-2026", wbs:"BNK-2026.1.3", name:"Banking, Payroll and ECP", act:"Functional consulting", proj:true, bukrs:"PT01", budget:480,
+     sap:{rproj:"BNK-2026.1.3", lstar:"CONS01", skostl:"PT4010", rkostl:"", aufnr:""}},
+    {code:"RTL-TT", wbs:"RTL-TT.2.1", name:"Retail, Time Tracking", act:"Functional consulting", proj:true, bukrs:"PT01", budget:360,
+     sap:{rproj:"RTL-TT.2.1", lstar:"CONS01", skostl:"PT4010", rkostl:"", aufnr:""}},
+    {code:"AER-WFM", wbs:"AER-WFM.4.2", name:"Airports, WFM rollout", act:"Project management", proj:true, bukrs:"PT01", budget:600,
+     sap:{rproj:"AER-WFM.4.2", lstar:"PMGT01", skostl:"PT4010", rkostl:"", aufnr:""}},
+    {code:"AXI-INT", wbs:"", name:"Internal, pre-sales and training", act:"Administrative", proj:false, bukrs:null,
+     sap:{rproj:"", lstar:"ADMIN1", skostl:"PT4010", rkostl:"PT4010", aufnr:""}},
+    {code:"HSP-FAC", wbs:"HSP-FAC.1.1", name:"Hospital campus, facilities maintenance", act:"Field service", proj:true, bukrs:"PT02", budget:300,
+     sap:{rproj:"HSP-FAC.1.1", lstar:"MAINT01", skostl:"PT4010", rkostl:"", aufnr:""}},
+    {code:"AER-FAC", wbs:"AER-FAC.2.1", name:"Airport terminal, facilities maintenance", act:"Field service", proj:true, bukrs:"PT02", budget:260,
+     sap:{rproj:"AER-FAC.2.1", lstar:"MAINT01", skostl:"PT4010", rkostl:"", aufnr:""}}
+  ];
+  var PERNR = "00104567";
+  var WORKDATES = [];
+  var DAYCAP = 8;
+  /* Every clock window (Z_BSRV) is assumed to carry its own 1h lunch break
+     in the middle; worked hours are the span minus this, see slotHours. */
+  var LUNCH_MIN = 60;
+
+  /* ---------- companies, IT0001 and CATS data entry profiles ----------
+     The entry mode is a business setting per company, never a user preference.
+     The company comes from the employee's IT0001 (Organizational Assignment)
+     and ZTIME_COMPANY_CFG maps it to a CATS data entry profile, with validity
+     dates, so a retroactive entry keeps the profile that was in force then.
+     Start and end are BEGUZ and ENDUZ, standard CATSDB fields whose visibility
+     is controlled by the profile, not by code in this application. */
+  var COMPANIES = [
+    {bukrs:"PT01", name:"Consulting and digital services"},
+    {bukrs:"PT02", name:"Building solutions and maintenance"}
+  ];
+  var PROFILES = {
+    Z_CONS:{code:"Z_CONS", name:"Consultants",       clock:false, overnight:false, fields:"Date, project, duration"},
+    Z_BSRV:{code:"Z_BSRV", name:"Building Solutions", clock:true,  overnight:true,  fields:"Date, project, start, end, computed duration"}
+  };
+  var ZTIME_COMPANY_CFG = [
+    {bukrs:"PT01", begda:"20200101", endda:"99991231", profile:"Z_CONS"},
+    {bukrs:"PT02", begda:"20200101", endda:"99991231", profile:"Z_BSRV"}
+  ];
+  var DEFAULT_PROFILE = "Z_CONS";
+
+  /* IT0001 of the person using the application. The switch in the header changes
+     it, which is the same as opening the sheet as someone assigned to the other
+     company. Nothing else in the application decides the entry mode. My week is
+     always a standard 8h/day schedule; reduced schedules are only modelled for
+     named people on the Team (mass entry) roster, see TEAM below. */
+  var IT0001 = {pernr:PERNR, bukrs:"PT01"};
+  function dailyCapFor(){ return DAYCAP; }
+
+  function profileCodeFor(bukrs, dateISO){
+    var hit = ZTIME_COMPANY_CFG.filter(function(c){
+      return c.bukrs === bukrs && c.begda <= dateISO && c.endda >= dateISO;
+    })[0];
+    return hit ? hit.profile : DEFAULT_PROFILE;
+  }
+  /* Read at the date of the entry, not today, so history is never reinterpreted. */
+  function profileFor(dateISO, bukrs){
+    return PROFILES[profileCodeFor(bukrs || IT0001.bukrs, dateISO || WORKDATES[0])];
+  }
+  function isClock(){ return profileFor(WORKDATES[0]).clock; }
+  function companyName(bukrs){
+    var c = COMPANIES.filter(function(x){ return x.bukrs === bukrs; })[0];
+    return c ? c.name : bukrs;
+  }
+
+  /* ---------- period control, monthly, per company ----------
+     A closed period rejects new entries and changes. Reopening is an HR action
+     and leaves a trace. */
+  var PERIODS = [
+    {bukrs:"PT01", ym:"202608", open:false, by:"HR, 3 Sep 2026"},
+    {bukrs:"PT01", ym:"202609", open:true,  by:""},
+    {bukrs:"PT01", ym:"202610", open:true,  by:""},
+    {bukrs:"PT02", ym:"202608", open:false, by:"HR, 3 Sep 2026"},
+    {bukrs:"PT02", ym:"202609", open:true,  by:""},
+    {bukrs:"PT02", ym:"202610", open:true,  by:""}
+  ];
+  function periodFor(dateISO, bukrs){
+    var b = bukrs || IT0001.bukrs, ym = String(dateISO).slice(0,6);
+    return PERIODS.filter(function(p){ return p.bukrs === b && p.ym === ym; })[0] || {bukrs:b, ym:ym, open:true, by:""};
+  }
+  function periodOpen(dateISO, bukrs){ return periodFor(dateISO, bukrs).open !== false; }
+  function weekPeriodClosed(){
+    for(var i=0; i<5; i++){ if(!periodOpen(WORKDATES[i])) return true; }
+    return false;
+  }
+
+  /* ---------- wage type catalogue ----------
+     Every allowance is a wage type valid in T512Z and authorised in the data
+     entry profile. Quantity goes to ANZHL. The bonus is the only one carrying
+     an amount, which CATSDB has no field for, so it travels in a customer
+     field and is created by the project owner, never by the employee. */
+  var WAGETYPES = [
+    {code:"AJC_NAC", lgart:"1200", name:"Domestic per diem",  unit:"days",   amount:false, needProj:true,  noteLabel:"",                     selfEntry:true},
+    {code:"AJC_INT", lgart:"1210", name:"Foreign per diem",   unit:"days",   amount:false, needProj:true,  noteLabel:"Country",              selfEntry:true},
+    {code:"KMS",     lgart:"1300", name:"Own-car kilometres", unit:"km",     amount:false, needProj:true,  noteLabel:"Origin and destination", selfEntry:true},
+    {code:"TURNO",   lgart:"1500", name:"Shift allowance",    unit:"days",   amount:false, needProj:false, noteLabel:"",                     selfEntry:true},
+    {code:"BONUS",   lgart:"1400", name:"Project bonus",      unit:"amount", amount:true,  needProj:true,  noteLabel:"Reason",               selfEntry:false}
+  ];
+  function wt(code){ return WAGETYPES.filter(function(w){ return w.code === code; })[0]; }
+  function wtFor(bukrs){
+    /* Shift allowance only makes sense where people work shifts. */
+    return WAGETYPES.filter(function(w){ return w.code !== "TURNO" || (bukrs || IT0001.bukrs) === "PT02"; });
+  }
+
+  /* ---------- team, for the leader's mass entry ----------
+     Scope is strictly by project ownership, never by line management: the
+     team a leader sees in mass entry is everyone allocated to the project
+     currently picked above the grid, whatever their manager in IT0001/OM
+     is. Rui Tavares is the deliberate exception: he works on Pedro Alves's
+     project (AER-WFM) and also on Ana Ferreira's (BNK-2026), independently
+     of who he reports to in the org chart. Every other consultant sits on
+     exactly one project - a Junior consultant showing up under a project
+     they don't actually work on isn't a multi-project feature, it's wrong
+     data - so Rui stays the one, named example of it, not the norm. Each
+     project's roster is 5 people, a realistic engagement team size. A
+     leader can still own more than one project at once, as Ricardo Nunes
+     does here: switching the project picker switches which 5-person
+     roster is on screen. */
+  var LEADERS = [
+    {id:"RN", name:"Ricardo Nunes", label:"RTL-TT + AXI-INT", projs:[1,3], bukrs:"PT01"},
+    {id:"PA", name:"Pedro Alves",   label:"AER-WFM", projs:[2], bukrs:"PT01"},
+    {id:"AF", name:"Ana Ferreira",  label:"BNK-2026", projs:[0], bukrs:"PT01"},
+    {id:"CP", name:"Carlos Pinto",  label:"HSP-FAC", projs:[4], bukrs:"PT02"},
+    {id:"MS", name:"Marco Silva",   label:"AER-FAC", projs:[5], bukrs:"PT02"}
+  ];
+  var TEAM = [
+    /* BNK-2026 */
+    {pernr:"00104501", name:"Marta Silva",     role:"Consultant",        bukrs:"PT01", projs:[0],   abs:{}, already:[8,8,4,0,0,0,0]},
+    {pernr:"00104504", name:"Rui Tavares",     role:"Consultant",        bukrs:"PT01", projs:[0,2], abs:{}, already:[8,0,8,0,0,0,0]},
+    {pernr:"00104513", name:"Beatriz Costa",   role:"Consultant",        bukrs:"PT01", projs:[0],   abs:{}, dailyHours:6, already:[6,6,0,0,0,0,0]},
+    {pernr:"00104514", name:"Tiago Almeida",   role:"Consultant",        bukrs:"PT01", projs:[0],   abs:{3:"Medical appointment"}, already:[8,4,0,0,0,0,0]},
+    {pernr:"00104515", name:"Mariana Neves",   role:"Junior consultant", bukrs:"PT01", projs:[0],   abs:{}, already:[0,8,8,0,0,0,0]},
+    /* RTL-TT */
+    {pernr:"00104502", name:"João Costa",      role:"Consultant",        bukrs:"PT01", projs:[1],   abs:{4:"Vacation"}, already:[4,4,4,4,0,0,0]},
+    {pernr:"00104503", name:"Inês Braga",      role:"Junior consultant", bukrs:"PT01", projs:[1],   abs:{}, locked:true, already:[8,8,8,8,8,0,0]},
+    {pernr:"00104516", name:"Vera Antunes",    role:"Consultant",        bukrs:"PT01", projs:[1],   abs:{}, already:[8,0,8,0,0,0,0]},
+    {pernr:"00104517", name:"Gonçalo Pinheiro",role:"Senior consultant", bukrs:"PT01", projs:[1],   abs:{}, already:[8,8,8,0,0,0,0]},
+    {pernr:"00104518", name:"Teresa Correia",  role:"Consultant",        bukrs:"PT01", projs:[1],   abs:{1:"Vacation"}, already:[8,0,4,0,0,0,0]},
+    /* AER-WFM */
+    {pernr:"00104505", name:"Sofia Marques",   role:"Architect",         bukrs:"PT01", projs:[2],   abs:{2:"Medical appointment"}, already:[0,4,4,8,0,0,0]},
+    {pernr:"00104519", name:"Vasco Pereira",   role:"Architect",         bukrs:"PT01", projs:[2],   abs:{}, already:[8,8,4,0,0,0,0]},
+    {pernr:"00104520", name:"Miguel Santos",   role:"Consultant",        bukrs:"PT01", projs:[2],   abs:{}, already:[4,4,0,0,0,0,0]},
+    {pernr:"00104521", name:"Rita Nunes",      role:"Consultant",        bukrs:"PT01", projs:[2],   abs:{}, already:[8,0,0,0,0,0,0]},
+    /* AXI-INT */
+    {pernr:"00104523", name:"Bárbara Moreira", role:"Consultant",        bukrs:"PT01", projs:[3],   abs:{}, already:[4,0,0,0,0,0,0]},
+    {pernr:"00104524", name:"Eduardo Cardoso", role:"Junior consultant", bukrs:"PT01", projs:[3],   abs:{},  already:[0,4,4,0,0,0,0]},
+    {pernr:"00104525", name:"Sara Martins",    role:"Consultant",        bukrs:"PT01", projs:[3],   abs:{0:"Vacation"}, already:[0,4,0,0,0,0,0]},
+    {pernr:"00104526", name:"Cláudia Ribeiro", role:"Architect",         bukrs:"PT01", projs:[3],   abs:{}, already:[8,0,4,0,0,0,0]},
+    {pernr:"00104527", name:"Diogo Ferreira",  role:"Consultant",        bukrs:"PT01", projs:[3],   abs:{}, already:[0,0,0,4,0,0,0]},
+    /* HSP-FAC */
+    {pernr:"00104510", name:"Nuno Dias",       role:"Technician",        bukrs:"PT02", projs:[4],   abs:{}, already:[8,8,0,0,0,0,0]},
+    {pernr:"00104511", name:"Hélder Rocha",    role:"Technician",        bukrs:"PT02", projs:[4],   abs:{}, dailyHours:6, already:[0,0,6,6,6,0,0]},
+    {pernr:"00104512", name:"Hugo Matos",      role:"Technician",        bukrs:"PT02", projs:[4],   abs:{1:"Vacation"}, already:[8,0,8,8,0,0,0]},
+    {pernr:"00104528", name:"Luís Teixeira",   role:"Technician",        bukrs:"PT02", projs:[4],   abs:{}, already:[8,8,8,0,0,0,0]},
+    {pernr:"00104529", name:"Sandra Fonseca",  role:"Senior technician", bukrs:"PT02", projs:[4],   abs:{}, already:[0,8,8,8,0,0,0]},
+    /* AER-FAC */
+    {pernr:"00104530", name:"Ana Pires",       role:"Technician",        bukrs:"PT02", projs:[5],   abs:{}, already:[8,8,0,0,0,0,0]},
+    {pernr:"00104531", name:"Bruno Alves",     role:"Technician",        bukrs:"PT02", projs:[5],   abs:{2:"Vacation"}, already:[8,0,8,0,0,0,0]},
+    {pernr:"00104532", name:"Carla Sousa",     role:"Senior technician", bukrs:"PT02", projs:[5],   abs:{}, already:[0,8,8,8,0,0,0]},
+    {pernr:"00104533", name:"Daniel Matos",    role:"Technician",        bukrs:"PT02", projs:[5],   abs:{}, dailyHours:6, already:[6,6,0,0,0,0,0]},
+    {pernr:"00104534", name:"Elsa Carvalho",   role:"Technician",        bukrs:"PT02", projs:[5],   abs:{0:"Medical appointment"}, already:[0,8,8,0,0,0,0]}
+  ];
+  function leaderById(id){ return LEADERS.filter(function(l){ return l.id === id; })[0] || LEADERS[0]; }
+  function teamOf(leaderId){
+    var l = leaderById(leaderId);
+    var pIdx = massProject();
+    /* If the currently selected project isn't even one of this leader's
+       own (mid leader-switch, before #mProj's options are re-synced),
+       fall back to the union of their projects rather than an empty or
+       wrong-leader team; renderTeam() re-syncs #mProj before this runs in
+       the normal render path, so this only guards the edge case. */
+    if(l.projs.indexOf(pIdx) === -1){
+      return TEAM.filter(function(m){
+        return m.projs.some(function(p){ return l.projs.indexOf(p) !== -1; });
+      });
+    }
+    return TEAM.filter(function(m){ return isEligibleForProject(m, pIdx); });
+  }
+  function projectsOf(leaderId){
+    return leaderById(leaderId).projs;
+  }
+  /* Hours, Allowances and Bonus each re-implement "is this team member
+     actually on the project a mass entry is about to bill to" - the exact
+     check an earlier pass missed for Allowances when leaders went from one
+     project to several. One shared predicate instead of three copies, so
+     the next feature can't leave it out the same way. */
+  function isEligibleForProject(m, pIdx){
+    return m.projs.indexOf(pIdx) !== -1;
+  }
+  /* Leaders stay in one company, whatever number of projects they own:
+     "acting as" only offers leaders of the company IT0001 currently reads,
+     the same rule Team entry already applies to who counts as someone's
+     team. */
+  function leadersForCompany(bukrs){
+    return LEADERS.filter(function(l){ return l.bukrs === bukrs; });
+  }
+  function renderLeaderOptions(){
+    var ls = $("leadSel");
+    if(!ls) return;
+    var opts = leadersForCompany(IT0001.bukrs);
+    if(opts.indexOf(leaderById(state.leader)) === -1 && opts.length){
+      state.leader = opts[0].id;
+    }
+    ls.innerHTML = "";
+    opts.forEach(function(l){
+      var o = document.createElement("option");
+      o.value = l.id; o.textContent = l.name + " · " + l.label;
+      ls.appendChild(o);
+    });
+    ls.value = state.leader;
+  }
+  /* Hours the person already has recorded this week, from their own sheet or a
+     previous mass entry, so the leader can see day load before staging more.
+     Sample only: weeks already posted or submitted are treated as complete on
+     their working days, next week has nothing yet, and this week has the hand
+     authored gaps in TEAM[].already, deliberately including someone already
+     at capacity so the "day already full" case is visible without more clicks. */
+  function alreadyHoursFor(m, weekNum){
+    var base;
+    if(weekNum >= 38) base = (m.already || [0,0,0,0,0,0,0]).slice();
+    else base = [0,1,2,3,4].reduce(function(acc,d){ acc[d] = m.abs[d] ? 0 : 8; return acc; }, [0,0,0,0,0,0,0]);
+    /* the sample "already" figures are a static baseline and never move;
+       without this, saving a mass entry made the read-only grid look like
+       the save had been lost the moment it succeeded, since staged (now 0)
+       was the only thing that had ever added to that baseline. */
+    state.massLog.forEach(function(e){
+      if(e.kind !== "hours" || e.pernr !== m.pernr) return;
+      var idx = WORKDATES.indexOf(e.date);
+      if(idx !== -1) base[idx] += e.hours;
+    });
+    return base;
+  }
+  /* Weekdays (Mon-Fri) with room left in this person's own daily capacity:
+     not blocked by an approved absence, period open, and whatever's
+     already saved plus staged doesn't already reach teamDailyCap(m) - a
+     day sitting at 2h of an 8h day still has 6h missing, not just a day
+     at exactly 0h. Computed up front so a "fill the gaps" request can
+     target exactly the days that actually have room, one person at a
+     time, instead of one day set forced onto everyone selected. */
+  function missingWeekdaysFor(m){
+    var already = alreadyHoursFor(m, WEEKS[weekIdx].num);
+    var st = stagedOf(m.pernr);
+    var days = [];
+    for(var d=0; d<5; d++){
+      if(memberBlocked(m,d)) continue;
+      if(!periodOpen(WORKDATES[d], m.bukrs)) continue;
+      if(teamDailyCap(m) - already[d] - (st.h[d]||0) <= 0) continue;
+      days.push(d);
+    }
+    return days;
+  }
+  /* How much more this person can take on this day before hitting their
+     own capacity - the actual amount missingWeekdaysFor's filter checks
+     is > 0 for, exposed separately since the day list alone isn't enough
+     to stage anything. */
+  function teamGapFor(m, d){
+    var already = alreadyHoursFor(m, WEEKS[weekIdx].num);
+    var st = stagedOf(m.pernr);
+    return Math.max(0, teamDailyCap(m) - already[d] - (st.h[d]||0));
+  }
+
+  var WEEKDAY_ABBR = ["Mon","Tue","Wed","Thu","Fri","Sat","Sun"];
+  var MONTHS = ["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"];
+  function datesFor(startISO){
+    var y = +startISO.slice(0,4), m = +startISO.slice(4,6)-1, d = +startISO.slice(6,8);
+    var base = new Date(Date.UTC(y,m,d));
+    var out = [];
+    for(var i=0; i<7; i++){
+      var dt = new Date(base.getTime());
+      dt.setUTCDate(base.getUTCDate()+i);
+      out.push(dt.toISOString().slice(0,10).replace(/-/g,""));
+    }
+    return out;
+  }
+  function daysFor(dates){
+    return dates.map(function(wd,i){ return WEEKDAY_ABBR[i] + " " + (+wd.slice(6,8)); });
+  }
+  /* "YYYYMMDD", local time, to compare directly against WORKDATES/datesFor
+     entries without any timezone conversion in between. */
+  function todayISO(){
+    var d = new Date();
+    return "" + d.getFullYear() + ((d.getMonth()+1)<10?"0":"")+(d.getMonth()+1) + (d.getDate()<10?"0":"")+d.getDate();
+  }
+  /* "we"/"today" for whichever of the 7 columns of the currently loaded
+     week (WORKDATES) index i falls on - shared by every grid keyed off
+     that one week (My Timesheet, Already-recorded, Team mass entry).
+     The month grid spans many weeks at once, so it compares full dates
+     instead - see monthDayExtraClass. */
+  function dayExtraClass(i){
+    return (i>4 ? " we" : "") + (WORKDATES[i] === todayISO() ? " today" : "");
+  }
+  function monthDayExtraClass(dayOfWeek, dateISO){
+    return (dayOfWeek>4 ? " we" : "") + (dateISO === todayISO() ? " today" : "");
+  }
+  /* Builds the weekday name and date number as two separate lines, always,
+     so every column header wraps the same way regardless of how wide each
+     abbreviation happens to render (natural text wrap broke that: some
+     day+number pairs fit one line, others didn't, at the same 58px width). */
+  function appendDayLabel(cell, i){
+    cell.appendChild(el("span","dname", WEEKDAY_ABBR[i]));
+    cell.appendChild(el("span","dnum", "" + (+WORKDATES[i].slice(6,8))));
+  }
+  function weekLabelFor(dates, num){
+    var s = dates[0], e = dates[6];
+    var sD = +s.slice(6,8), sM = +s.slice(4,6)-1, eD = +e.slice(6,8), eM = +e.slice(4,6)-1, y = s.slice(0,4);
+    var range = sM === eM
+      ? t("label_range_same_month", {d1: sD, d2: eD, month: MONTHS[sM]})
+      : t("label_range_diff_month", {d1: sD, m1: MONTHS[sM], d2: eD, m2: MONTHS[eM]});
+    return t("label_week_n", {n: num, range: range, y: y});
+  }
+
+  /* Absences come from the Leave Request, read-only in this application. Sample data
+     covers a few weeks: a posted week, a submitted one, the current draft, and an
+     upcoming one, so week navigation has something real to show. */
+  function absStatusLabel(status){ return t("status_" + status); }
+  /* "Joule" is left as-is: it's the assistant's brand name, not a status word. */
+  function originLabel(o){
+    if(o === "Manual") return t("val_manual");
+    if(o === "Suggested") return t("origin_suggested");
+    if(o === "Copied") return t("origin_copied");
+    return o;
+  }
+  /* Sample approval exceptions, translated by known value; an unrecognized
+     note (shouldn't happen with the fixed sample data) falls back to itself. */
+  function approvalNoteLabel(note){
+    if(note === "Pending leave request overlaps recorded hours") return t("note_pending_leave_conflict");
+    if(note === "Two empty working days") return t("note_two_empty_days");
+    return note;
+  }
+  /* ---------- Entry detail: project effort and audit trail ----------
+     The budget bar and audit fields used to be static markup, identical
+     for every row. Actual hours are summed live from this company's own
+     WEEKS; "created by"/"last changed" have no real history to read in
+     this mockup, so they're a stable (not random - same row always shows
+     the same values) pseudo date derived from a seed, not a live clock. */
+  var EMPLOYEE_NAME = "Tiago Leal";
+  function projectActualHours(pIdx){
+    return WEEKS.reduce(function(a, w){
+      return a + w.rows.filter(function(r){ return r.p === pIdx; }).reduce(function(x, r){ return x + rowTotal(r); }, 0);
+    }, 0);
+  }
+  function stableSeed(parts){
+    var s = parts.join("|"), h = 0;
+    for(var i = 0; i < s.length; i++) h = (h * 31 + s.charCodeAt(i)) >>> 0;
+    return h;
+  }
+  function auditTextFor(seed){
+    var day = 10 + (seed % 10);
+    var hour = 8 + (seed % 10);
+    var minute = (seed * 7) % 60;
+    var hh = (hour < 10 ? "0" : "") + hour, mm = (minute < 10 ? "0" : "") + minute;
+    return EMPLOYEE_NAME + ", " + day + " " + MONTHS[8] + " 2026 " + hh + ":" + mm;
+  }
+  function setDetailBudgetAndAudit(pIdx, seedParts){
+    var pr = PROJECTS[pIdx];
+    var box = $("dtBudgetBox");
+    if(box) box.hidden = !pr.budget;
+    if(pr.budget){
+      var actual = projectActualHours(pIdx);
+      $("dtBudgetNum").textContent = fmt(actual) + " / " + pr.budget + " h";
+      $("dtBudgetBar").style.width = Math.min(100, Math.round(actual / pr.budget * 100)) + "%";
+    }
+    var seed = stableSeed(seedParts);
+    $("dtCreatedBy").textContent = auditTextFor(seed);
+    $("dtLastChanged").textContent = auditTextFor(seed + 97);
+  }
+  /* Sample weeks are per company, keyed by the same num/start so the
+     week navigator stays aligned: switching IT0001 is opening the sheet
+     as someone assigned to that company, projects and absences included,
+     not just a different input layout. */
+  var WEEKS_PT01 = [
+    { num:32, start:"20260803", submitted:true,
+      absences:[
+        {id:"ab32a", day:4, type:"Vacation", awart:"0100", hours:8, status:"approved", src:"Request 4500301"}
+      ],
+      rows:[
+        {id:601, p:0, desc:"Payroll requirements review", h:[4,4,4,4,0,0,0], origin:"Manual"},
+        {id:602, p:1, desc:"Time tracking rollout support", h:[4,4,4,4,0,0,0], origin:"Manual"}
+      ],
+      allow:[],
+      sugs:[]
+    },
+    { num:33, start:"20260810", submitted:true,
+      absences:[],
+      rows:[
+        {id:603, p:0, desc:"Payroll requirements review", h:[4,4,4,4,4,0,0], origin:"Manual"},
+        {id:604, p:2, desc:"WFM rollout kickoff prep", h:[4,4,4,4,4,0,0], origin:"Manual"}
+      ],
+      allow:[],
+      sugs:[]
+    },
+    { num:34, start:"20260817", submitted:true,
+      absences:[
+        {id:"ab34a", day:0, type:"Vacation", awart:"0100", hours:8, status:"approved", src:"Request 4500312"},
+        {id:"ab34b", day:1, type:"Vacation", awart:"0100", hours:8, status:"approved", src:"Request 4500312"},
+        {id:"ab34c", day:2, type:"Vacation", awart:"0100", hours:8, status:"approved", src:"Request 4500312"},
+        {id:"ab34d", day:3, type:"Vacation", awart:"0100", hours:8, status:"approved", src:"Request 4500312"},
+        {id:"ab34e", day:4, type:"Vacation", awart:"0100", hours:8, status:"approved", src:"Request 4500312"}
+      ],
+      rows:[],
+      allow:[],
+      sugs:[]
+    },
+    { num:35, start:"20260824", submitted:true,
+      absences:[],
+      rows:[
+        {id:96, p:0, desc:"Payroll cutover planning", h:[4,4,4,4,4,0,0], origin:"Manual"},
+        {id:97, p:1, desc:"Time tracking rollout scoping", h:[4,4,4,4,4,0,0], origin:"Manual"}
+      ],
+      allow:[],
+      sugs:[]
+    },
+    { num:36, start:"20260831", submitted:true,
+      absences:[],
+      rows:[
+        {id:101, p:0, desc:"Payroll cutover testing", h:[4,4,4,4,4,0,0], origin:"Manual"},
+        {id:102, p:1, desc:"Time tracking rollout support", h:[4,4,4,4,4,0,0], origin:"Manual"}
+      ],
+      allow:[],
+      sugs:[]
+    },
+    { num:37, start:"20260907", submitted:true,
+      absences:[
+        {id:"ab37a", day:4, type:"Vacation", awart:"0100", hours:8, status:"approved", src:"Request 4500198"}
+      ],
+      rows:[
+        {id:103, p:0, desc:"Payroll parallel run", h:[4,4,4,4,0,0,0], origin:"Manual"},
+        {id:104, p:2, desc:"WFM rollout kickoff", h:[4,4,4,4,0,0,0], origin:"Suggested"}
+      ],
+      allow:[],
+      sugs:[]
+    },
+    { num:38, start:"20260914", submitted:false,
+      absences:[
+        {id:"ab1", day:2, type:"Medical appointment", awart:"0210", hours:4, status:"approved", src:"Request 4500219"},
+        {id:"ab2", day:4, type:"Vacation", awart:"0100", hours:8, status:"approved", src:"Request 4500221"},
+        {id:"ab3", day:3, type:"Vacation", awart:"0100", hours:8, status:"pending", src:"Request 4500230"}
+      ],
+      rows:[
+        {id:1, p:0, desc:"Requirements workshop, payroll", h:[3,4,0,2,0,0,0], origin:"Manual"},
+        {id:2, p:1, desc:"Time recording solution design", h:[2,0,2,0,0,0,0], origin:"Suggested"},
+        {id:3, p:3, desc:"", h:[1,0,0,1.5,0,0,0], origin:"Manual"}
+      ],
+      allow:[
+        {id:"al1", day:0, p:0, code:"AJC_NAC", qty:1,  amount:0, note:"", by:"00104567", onBehalf:"00104567"},
+        {id:"al2", day:0, p:0, code:"KMS",     qty:86, amount:0, note:"Lisbon to Porto and back", by:"00104567", onBehalf:"00104567"},
+        {id:"al3", day:1, p:2, code:"AJC_INT", qty:1,  amount:0, note:"Spain", by:"00104567", onBehalf:"00104567"}
+      ],
+      sugs:[
+        {id:"s1", hours:2.5, day:2, p:2, why:"3 client meetings on the calendar", conf:"hi", desc:"Rollout follow-up meetings"},
+        {id:"s2", hours:1.5, day:3, p:1, why:"12 changes in the project repository", conf:"hi", desc:"Time rules configuration"},
+        {id:"s3", hours:2, day:4, p:0, why:"4 tickets handled in Cloud ALM", conf:"mid", desc:"Post-testing payroll fixes"},
+        {id:"s4", hours:1, day:4, p:3, why:"Block with no attributable signal", conf:"low", desc:""}
+      ]
+    },
+    { num:39, start:"20260921", submitted:false,
+      absences:[
+        {id:"ab39a", day:0, type:"Vacation", awart:"0100", hours:8, status:"pending", src:"Request 4500255"}
+      ],
+      rows:[
+        {id:605, p:0, desc:"Payroll steering follow-up", h:[4,4,2,0,0,0,0], origin:"Manual"}
+      ],
+      allow:[],
+      sugs:[
+        {id:"s5", hours:2, day:1, p:0, why:"2 client meetings on the calendar", conf:"hi", desc:"Payroll steering follow-up"}
+      ]
+    },
+    { num:40, start:"20260928", submitted:false,
+      absences:[
+        {id:"ab40a", day:1, type:"Medical appointment", awart:"0210", hours:2, status:"approved", src:"Request 4500270"}
+      ],
+      rows:[
+        {id:98, p:0, desc:"Payroll go-live support", h:[4,4,0,4,0,0,0], origin:"Manual"},
+        {id:94, p:2, desc:"WFM rollout stabilization", h:[0,0,4,0,0,0,0], origin:"Manual"}
+      ],
+      allow:[],
+      sugs:[
+        {id:"s6", hours:2, day:3, p:0, why:"3 tickets handled in Cloud ALM", conf:"hi", desc:"Payroll post-go-live fixes"}
+      ]
+    },
+    { num:41, start:"20261005", submitted:false,
+      absences:[],
+      rows:[
+        {id:95, p:1, desc:"Retail rollout wave 2 kickoff", h:[4,4,0,0,0,0,0], origin:"Manual"}
+      ],
+      allow:[],
+      sugs:[]
+    },
+    { num:42, start:"20261012", submitted:false,
+      absences:[],
+      rows:[
+        {id:607, p:0, desc:"Payroll go-live support", h:[4,4,4,4,0,0,0], origin:"Manual"},
+        {id:608, p:2, desc:"WFM rollout stabilization", h:[4,4,0,4,4,0,0], origin:"Manual"}
+      ],
+      allow:[],
+      sugs:[]
+    },
+    { num:43, start:"20261019", submitted:false,
+      absences:[],
+      rows:[
+        {id:609, p:1, desc:"Retail rollout wave 2 support", h:[4,4,0,0,0,0,0], origin:"Manual"}
+      ],
+      allow:[],
+      sugs:[]
+    },
+    { num:44, start:"20261026", submitted:false,
+      absences:[],
+      rows:[
+        {id:610, p:0, desc:"Payroll go-live support", h:[4,0,0,0,0,0,0], origin:"Manual"}
+      ],
+      allow:[],
+      sugs:[]
+    }
+  ];
+  var WEEKS_PT02 = [
+    { num:36, start:"20260831", submitted:true,
+      absences:[],
+      rows:[
+        {id:501, p:4, desc:"Elevator preventive maintenance", h:[4,4,4,4,4,0,0], origin:"Manual"},
+        {id:502, p:3, desc:"Site safety briefing", h:[1,0,1,0,0,0,0], origin:"Manual"}
+      ],
+      allow:[],
+      sugs:[]
+    },
+    { num:37, start:"20260907", submitted:true,
+      absences:[
+        {id:"pb37a", day:3, type:"Medical appointment", awart:"0210", hours:2, status:"approved", src:"Request 4500205"}
+      ],
+      rows:[
+        {id:503, p:4, desc:"HVAC filter replacement round", h:[4,4,4,0,4,0,0], origin:"Manual"},
+        {id:504, p:4, desc:"Fire safety systems check", h:[0,0,0,3,0,0,0], origin:"Suggested"}
+      ],
+      allow:[],
+      sugs:[]
+    },
+    { num:38, start:"20260914", submitted:false,
+      absences:[
+        {id:"pb1", day:2, type:"Medical appointment", awart:"0210", hours:4, status:"approved", src:"Request 4500219"},
+        {id:"pb2", day:4, type:"Vacation", awart:"0100", hours:8, status:"approved", src:"Request 4500221"},
+        {id:"pb3", day:3, type:"Vacation", awart:"0100", hours:8, status:"pending", src:"Request 4500230"}
+      ],
+      rows:[
+        {id:511, p:4, desc:"Boiler room inspection", h:[3,4,0,2,0,0,0], origin:"Manual"},
+        {id:512, p:4, desc:"Elevator call-out repair", h:[2,0,3,0,0,0,0], origin:"Suggested"},
+        {id:513, p:3, desc:"", h:[1,0,0,1.5,0,0,0], origin:"Manual"}
+      ],
+      allow:[
+        {id:"pal1", day:0, p:4, code:"TURNO", qty:1,  amount:0, note:"", by:"00104567", onBehalf:"00104567"},
+        {id:"pal2", day:0, p:4, code:"KMS",   qty:42, amount:0, note:"Depot to hospital campus and back", by:"00104567", onBehalf:"00104567"}
+      ],
+      sugs:[
+        {id:"ps1", hours:2.5, day:2, p:4, why:"3 work orders closed in the maintenance log", conf:"hi", desc:"Follow-up repairs"},
+        {id:"ps2", hours:1.5, day:3, p:4, why:"12 changes in the maintenance ticket system", conf:"hi", desc:"HVAC configuration"},
+        {id:"ps3", hours:2, day:4, p:4, why:"4 tickets handled in Cloud ALM", conf:"mid", desc:"Post-inspection fixes"},
+        {id:"ps4", hours:1, day:4, p:3, why:"Block with no attributable signal", conf:"low", desc:""}
+      ]
+    },
+    { num:39, start:"20260921", submitted:false,
+      absences:[
+        {id:"pb39a", day:0, type:"Vacation", awart:"0100", hours:8, status:"pending", src:"Request 4500255"}
+      ],
+      rows:[],
+      allow:[],
+      sugs:[
+        {id:"ps5", hours:2, day:1, p:4, why:"2 work orders on the maintenance calendar", conf:"hi", desc:"Facilities steering follow-up"}
+      ]
+    },
+    { num:40, start:"20260928", submitted:false,
+      absences:[
+        {id:"pb40a", day:2, type:"Vacation", awart:"0100", hours:8, status:"approved", src:"Request 4500281"}
+      ],
+      rows:[
+        {id:514, p:4, desc:"Elevator preventive maintenance", h:[4,4,0,4,4,0,0], origin:"Manual"},
+        {id:515, p:5, desc:"Terminal HVAC inspection round", h:[4,4,4,4,0,0,0], origin:"Manual"}
+      ],
+      allow:[
+        {id:"pal3", day:0, p:5, code:"TURNO", qty:1, amount:0, note:"", by:"00104567", onBehalf:"00104567"}
+      ],
+      sugs:[
+        {id:"ps6", hours:2, day:1, p:5, why:"3 work orders closed in the maintenance log", conf:"hi", desc:"Follow-up repairs"}
+      ]
+    },
+    { num:41, start:"20261005", submitted:false,
+      absences:[],
+      rows:[
+        {id:516, p:4, desc:"Boiler room inspection", h:[3,0,3,0,0,0,0], origin:"Manual"},
+        {id:517, p:5, desc:"Baggage handling systems check", h:[0,4,4,0,0,0,0], origin:"Suggested"}
+      ],
+      allow:[],
+      sugs:[
+        {id:"ps7", hours:1.5, day:3, p:5, why:"12 changes in the maintenance ticket system", conf:"mid", desc:"Terminal configuration"}
+      ]
+    }
+  ];
+  /* The PT02 sample rows only ever specified a duration; Z_BSRV always
+     needs a start and end too, so back-fill one for every week here,
+     once, rather than leaving it to whichever week happens to be loaded
+     when seedClock() next runs. */
+  WEEKS_PT02.forEach(function(w){ seedClockRows(w.rows); });
+  var WEEKS = WEEKS_PT01;
+  var weekIdx = 6; // week 38, the default landing week (index shifts whenever a week is added before it)
+  var ABSENCES = WEEKS[weekIdx].absences;
+  WORKDATES = datesFor(WEEKS[weekIdx].start);
+  DAYS = daysFor(WORKDATES);
+
+  function absOn(day, status){
+    return ABSENCES.filter(function(a){ return a.day === day && (!status || a.status === status); });
+  }
+  function absHours(day){
+    return absOn(day, "approved").reduce(function(s,a){ return s + a.hours; },0);
+  }
+  function capacity(day){
+    if(day > 4) return 0;
+    return Math.max(0, dailyCapFor() - absHours(day));
+  }
+  function isBlocked(day){ return day <= 4 && capacity(day) === 0; }
+  function weekCapacity(){
+    var c = 0;
+    for(var i=0; i<5; i++) c += capacity(i);
+    return c;
+  }
+
+  /* ---------- monthly reporting, consulting only ----------
+     Building Solutions stays weekly, unchanged. Consulting reports by
+     calendar month, so the weekly data underneath (still one object per
+     week, with its own rows/absences/allow) is grouped and shown together
+     instead of navigated week by week.
+     The *Of() helpers below take a week explicitly and never read the
+     app's single "current week" globals - a month cell's own input handler
+     always has to use the capacity/absences of the week it actually sits
+     in, whichever week the rest of the app happens to be pointed at. */
+  function isMonthly(){ return IT0001.bukrs === "PT01"; }
+  /* A week that spans two calendar months (e.g. starts the last Monday of
+     August, mostly runs into September) belongs to whichever month has
+     most of its 7 days, not to the month its start date happens to fall
+     in - otherwise a week that's six-sevenths September gets filed under
+     August, and the September grid opens on day 7 with nothing before it. */
+  function monthKeyOf(week){
+    var counts = {};
+    datesFor(week.start).forEach(function(d){
+      var k = d.slice(0,6);
+      counts[k] = (counts[k] || 0) + 1;
+    });
+    var best = week.start.slice(0,6), bestN = -1;
+    Object.keys(counts).forEach(function(k){ if(counts[k] > bestN){ bestN = counts[k]; best = k; } });
+    return best;
+  }
+  /* All the calendar dates of a YYYYMM month, and which week+day-index
+     (into the underlying WEEKS data) each one comes from. This is the
+     actual rendering unit for the monthly view - not "the weeks this
+     month owns" (monthKeyOf, used only to order months for prev/next) -
+     so a day from a neighbouring month never shows, and every day this
+     month actually has shows, even from a week whose majority belongs
+     to a different month (its non-matching days just aren't in the
+     list). */
+  function monthDatesFor(ym){
+    var y = +ym.slice(0,4), m = +ym.slice(4,6) - 1;
+    var daysInMonth = new Date(Date.UTC(y, m+1, 0)).getUTCDate();
+    var out = [];
+    for(var d=1; d<=daysInMonth; d++) out.push(ym + (d < 10 ? "0"+d : ""+d));
+    return out;
+  }
+  function weekDayFor(dateISO){
+    for(var i=0; i<WEEKS.length; i++){
+      var idx = datesFor(WEEKS[i].start).indexOf(dateISO);
+      if(idx !== -1) return {week:WEEKS[i], day:idx};
+    }
+    return null;
+  }
+  function activeMonthDates(){
+    return monthDatesFor(monthKeyOf(WEEKS[weekIdx])).filter(function(d){ return weekDayFor(d); });
+  }
+  function touchedWeeksFor(dates){
+    var seen = {}, out = [];
+    dates.forEach(function(d){
+      var wd = weekDayFor(d);
+      if(wd && !seen[wd.week.num]){ seen[wd.week.num] = 1; out.push(wd.week); }
+    });
+    return out;
+  }
+  function activeMonthWeeks(){ return touchedWeeksFor(activeMonthDates()); }
+  function absHoursOf(week, day){
+    return week.absences.filter(function(a){ return a.day === day && a.status === "approved"; })
+      .reduce(function(s,a){ return s + a.hours; }, 0);
+  }
+  function capacityOf(week, day){
+    if(day > 4) return 0;
+    return Math.max(0, dailyCapFor() - absHoursOf(week, day));
+  }
+  function isBlockedOf(week, day){ return day <= 4 && capacityOf(week, day) === 0; }
+  function dayTotalOf(week, day){
+    return week.rows.reduce(function(a,r){ return a + (r.h[day] || 0); }, 0);
+  }
+  function cellLockedOf(week, day, v){
+    return week.submitted || !periodOpen(datesFor(week.start)[day]) || (isBlockedOf(week, day) && !v);
+  }
+  /* Points the app's single-week globals at `week`, runs fn(), restores
+     them. Safe only for code that finishes before this call returns -
+     never for an event handler whose closure outlives it, which is why
+     month grid cells use the *Of() helpers above instead of this. */
+  function withWeek(week, fn){
+    var savedIdx = weekIdx, savedRows = state.rows, savedAllow = state.allow, savedSugs = state.sugs,
+        savedAbs = ABSENCES, savedDates = WORKDATES, savedDays = DAYS, savedSubmitted = state.submitted;
+    weekIdx = WEEKS.indexOf(week);
+    ABSENCES = week.absences;
+    WORKDATES = datesFor(week.start);
+    DAYS = daysFor(WORKDATES);
+    state.rows = week.rows;
+    state.allow = week.allow || (week.allow = []);
+    state.sugs = week.sugs || [];
+    state.submitted = week.submitted;
+    var result = fn(week);
+    weekIdx = savedIdx; ABSENCES = savedAbs; WORKDATES = savedDates; DAYS = savedDays;
+    state.rows = savedRows; state.allow = savedAllow; state.sugs = savedSugs; state.submitted = savedSubmitted;
+    return result;
+  }
+  /* Only the weeks still open need to be error-free to submit the month -
+     an already-submitted week (its own history, frozen before this month
+     even existed as a grouping) can carry an old conflict, like hours on
+     a day whose period closed after the fact, without holding the weeks
+     that still need submitting hostage to it. A day-specific error whose
+     date falls outside this month (a boundary week straddling two months)
+     doesn't block this month either - that day belongs to the other one. */
+  function monthErrors(dates){
+    var out = [];
+    touchedWeeksFor(dates).filter(function(w){ return !w.submitted; }).forEach(function(w){
+      withWeek(w, function(){
+        validate().filter(function(m){ return m.sev === "e"; }).forEach(function(m){
+          if(typeof m.day === "number" && dates.indexOf(datesFor(w.start)[m.day]) === -1) return;
+          m.week = w;
+          out.push(m);
+        });
+      });
+    });
+    return out;
+  }
+  function monthCapacityTotal(dates){
+    return dates.reduce(function(a,d){ var wd = weekDayFor(d); return a + (wd ? capacityOf(wd.week, wd.day) : 0); }, 0);
+  }
+  function monthTotalHours(dates){
+    return dates.reduce(function(a,d){ var wd = weekDayFor(d); return a + (wd ? dayTotalOf(wd.week, wd.day) : 0); }, 0);
+  }
+  /* One logical row per project across the whole month, sourced from
+     whichever weeks already have a row for it; desc is shared, taken from
+     the first week that has one. Hours stay per week, read through
+     monthRowIn() below - there is no merged hours array. */
+  function monthProjectRows(weeks){
+    var byP = {}, order = [];
+    weeks.forEach(function(w){
+      w.rows.forEach(function(r){
+        if(!byP[r.p]){ byP[r.p] = {p:r.p, desc:r.desc || ""}; order.push(r.p); }
+        else if(!byP[r.p].desc && r.desc) byP[r.p].desc = r.desc;
+      });
+    });
+    return order.map(function(p){ return byP[p]; });
+  }
+  function monthRowIn(week, p){
+    return week.rows.filter(function(r){ return r.p === p; })[0] || null;
+  }
+
+  /* ---------- i18n ----------
+     UI chrome (static markup, KPIs/chips/counts, toasts, validation
+     messages, day/month names) is translated. Mock business data
+     (employee names, project names, wage types, absence reasons) stays
+     as-is, same as a real SAP system where only the interface, not
+     master data, is language-dependent. The Joule assistant's own chat
+     messages are a separate follow-up, not covered here yet. */
+  var I18N = {
+    en: {
+      brand_title:"Time Recording", brand_subtitle:"Fiori Prototype",
+      capture_on:"Suggestions on, private timeline", capture_off:"Capture paused",
+      aria_it0001:"Company of the employee, from IT0001",
+      aria_project_billing:"Project to bill and staff mass entries for", aria_leader_scope:"Leader and scope",
+      aria_mass_entry_section:"Mass entry section", label_approval_week37:"Timesheet approval, week 37",
+      label_week_n:"Week {n}, {range} {y}", label_range_same_month:"{d1} to {d2} {month}", label_range_diff_month:"{d1} {m1} to {d2} {m2}",
+      status_approved:"Approved", status_pending:"Pending request",
+      dlg_new_entry_title:"New entry", origin_suggested:"Suggested", origin_copied:"Copied",
+      dlg_submit_month_title:"Submit {month} {y}", dlg_submit_week_title:"Submit week {n}",
+      ui_undo:"Undo", ui_resolve:"Resolve", ui_reopen:"Reopen",
+      toast_bad_duration:"Couldn't read “{v}”. Use 1.5, 1:30 or 90m.",
+      toast_only_available:" Only {left} h available.", toast_no_hours_available:" No hours available on this day.",
+      toast_bad_clock:"Couldn't read “{v}”. Use 08:00 or 8.",
+      toast_row_removed:"Row removed.",
+      toast_month_submitted_no_rows:"This month is already submitted, no more rows can be added.",
+      toast_all_projects_used_month:"Every project available to this company already has a row this month.",
+      toast_no_earlier_months:"No earlier sample months.", toast_no_later_months:"No later sample months.",
+      toast_sugg_blocked_absence:"{day} has an approved absence, the suggestion can't be applied.",
+      toast_suggestion_accepted:"Suggestion accepted on {day}.",
+      toast_suggestion_dismissed:"Suggestion dismissed. The pattern won't be proposed again.",
+      toast_absence_approved_conflict:"Absence approved on {day}. The {h} h recorded that day are now in conflict.",
+      toast_absence_approved_no_conflict:"Absence approved on {day}. The day is no longer available for time entry.",
+      toast_hours_moved:"{h} h moved from {from} to {to}.",
+      toast_hours_removed_no_capacity:"{h} h removed from {day}, no day had free capacity.",
+      toast_allowance_removed:"{name} removed.",
+      toast_week_submitted_no_allow_change:"The week is submitted, allowances can't be changed.",
+      toast_week_closed_period:"This week falls in a closed period.",
+      toast_qty_must_be_positive:"The quantity needs to be a number above zero.",
+      toast_allowance_recorded:"{name} recorded on {day}.",
+      toast_bad_number:"Couldn't read “{v}”.",
+      toast_capacity_on_day:"{name}'s capacity is {cap} h on {day}.",
+      toast_select_person_first:"Select at least one person first.",
+      toast_give_duration_or_clock:"Give a duration, or a start and end time.",
+      toast_pick_a_day:"Pick at least one day.",
+      toast_cells_filled:"{n} cells filled for {people} people. Nothing is saved yet, review the grid first.",
+      cells_skipped_field_one:" {n} cell skipped, needs the other field for that profile.",
+      cells_skipped_field_other:" {n} cells skipped, needs the other field for that profile.",
+      cells_skipped_capacity_one:" {n} cell skipped, over that person's daily capacity.",
+      cells_skipped_capacity_other:" {n} cells skipped, over that person's daily capacity.",
+      toast_team_entries_partial:"{saved} entries recorded for {who}. {left} on screen with the reason. Click Save to finish.",
+      toast_team_entries_all:"{saved} entries recorded for {who}, on their behalf. Click Save to finish.",
+      toast_team_entries_none:"Nothing was recorded. Every line has a reason next to it.",
+      toast_give_qty_positive:"Give a quantity above zero.",
+      toast_note_required_for:"{note} is required for {name}.",
+      allow_lines_staged_one:"{n} allowance line staged for {people} people. Nothing is saved yet.",
+      allow_lines_staged_other:"{n} allowance lines staged for {people} people. Nothing is saved yet.",
+      toast_allow_skipped_company:" {n} skipped, the shift allowance doesn't apply to their company.",
+      toast_allow_skipped_project:" {n} skipped, not allocated to {code}.",
+      toast_nothing_staged:"Nothing staged.",
+      allow_lines_recorded_one:"{n} allowance line recorded, on their behalf. Click Save to finish.",
+      allow_lines_recorded_other:"{n} allowance lines recorded, on their behalf. Click Save to finish.",
+      toast_nothing_to_save:"Nothing to save.", toast_changes_saved:"Changes saved.",
+      toast_amount_must_be_positive:"The amount needs to be a number above zero.",
+      toast_bonus_reason_required:"The bonus needs a reason. It is the only trace of why the project carried this cost.",
+      toast_none_allocated:"None of the selected people are allocated to {code}.",
+      toast_bonus_recorded:"{amount} EUR bonus recorded for {names}, approved in the same act.",
+      toast_bonus_none_recorded:"Nothing was actually recorded.",
+      toast_bonus_skipped_ineligible:" {names} skipped, not allocated to {code}.",
+      toast_bonus_skipped_closed:" {names} skipped, every day this week falls in a closed period.",
+      toast_week_submitted_no_rows:"This week is already submitted, no more rows can be added.",
+      toast_all_projects_used_week:"Every project available to this company already has a row this week.",
+      toast_copy_week_done:"Previous week's structure copied, without durations. {n} new rows.",
+      toast_copy_week_none:"All of last week's rows are already present.",
+      toast_no_earlier_weeks:"No earlier sample weeks.", toast_no_later_weeks:"No later sample weeks.",
+      toast_template_applied:"Allocation template applied to working days.",
+      toast_it0001_changed:"IT0001 now reads {bukrs}. ZTIME_COMPANY_CFG maps it to {code}: {fields}.",
+      toast_week_submitted_locked:"The week is submitted, it can't be changed.",
+      toast_day_absence_blocked:"{day} has an approved absence, doesn't accept time entries.",
+      toast_day_closed_period:"{day} falls in a closed period, it can't take new hours.",
+      toast_hours_recorded:"{h} h recorded in {code}, {day}.",
+      toast_entry_added:"Entry added.",
+      toast_row_exists_week:"{code} already has a row this week. Remove or merge it first.",
+      toast_entry_updated:"Entry updated.",
+      toast_row_exists_month:"{code} already has a row this month. Remove or merge it first.",
+      weeks_submitted_approval_one:"{n} week submitted for approval. Click Save to finish.",
+      weeks_submitted_approval_other:"{n} weeks submitted for approval. Click Save to finish.",
+      toast_week_submitted_approval:"Week {n} submitted for approval. Click Save to finish.",
+      toast_high_conf_applied:"{n} high-confidence suggestions applied. Medium and low confidence ones are still to review.",
+      toast_timeline_deleted:"Raw timeline deleted. Pending suggestions disappeared with it.",
+      toast_timesheets_approved:"{n} timesheets approved in a single call. Exceptions remain for review.",
+      toast_voice_error:"Voice input error: {err}",
+      toast_staged_entries_cleared:"Staged entries cleared. Nothing had been saved.",
+      toast_staged_allow_cleared:"Staged allowances cleared. Nothing had been saved.",
+      val_day_exceeds_24h:"The total for {day} exceeds 24 hours.",
+      val_desc_required:"Project entries need a description: {code}.",
+      val_absence_move_hours:"{day} has an approved {type}. The {h} h recorded need to move off this day.",
+      val_partial_absence_capacity:"{day} has an approved partial absence. Day capacity is {cap} h and {tot} h are recorded.",
+      val_day_capacity:"{day}'s capacity is {cap} h; {tot} h are recorded.",
+      val_pending_leave_conflict:"{day} has a pending leave request and recorded hours. If the request is approved, these hours will conflict.",
+      val_day_empty:"{day} is empty.",
+      val_week_below_expected:"The week has {tot} h recorded; the expected total with absences deducted is {expect} h.",
+      val_closed_period:"{day} falls in period {ym}, closed for {bukrs}. Reopening is an HR action.",
+      val_overlapping_windows:"{day} has overlapping time windows: {t1} to {t2} and {t3} to {t4}.",
+      val_window_needs_both:"{day}, {code}: the window needs both a start and an end.",
+      val_allow_note_needed:"{name} on {day} needs {noteLabel}.",
+      val_allow_closed_period:"{name} on {day} falls in a closed period.",
+      val_allow_no_amount:"{name} on {day} has no amount.",
+      val_allow_no_qty:"{name} on {day} has no quantity.",
+      n_suggestions_to_review2_one:"{n} suggestion still to review in the side panel.",
+      n_suggestions_to_review2_other:"{n} suggestions still to review in the side panel.",
+      suggestions_discarded_one:"{n} suggestion discarded for falling on days with an approved absence.",
+      suggestions_discarded_other:"{n} suggestions discarded for falling on days with an approved absence.",
+      th_project_wbs_activity:"Project, WBS and activity", row_total_per_day:"Total per day", btn_remove:"Remove",
+      tip_approved_partial_absence:"Approved partial absence, capacity of {h} h this day",
+      btn_copy_last_week:"Copy last week", btn_add_first_project:"Add the first project",
+      btn_resume_suggestions:"Resume suggestions", btn_simulate_approval:"Simulate approval",
+      tip_bonus_remove_restricted:"The bonus is removed by the project owner, on the team screen.",
+      text_no_records_to_generate:"No hours and no allowances this week, so there are no records to generate.",
+      voice_not_supported:"Voice input not supported in this browser",
+      tip_absence_not_available:"Approved {type}, day not available for time entry",
+      text_desc_required:"Description required", text_no_description:"No description",
+      aria_remove_row:"Remove row {name}",
+      tip_period_closed:"Period {ym} is closed for {bukrs}. Reopening is an HR action.",
+      placeholder_desc_required_once:"Description (required once hours are logged)", placeholder_description_short:"Description",
+      text_absence_generic:"absence",
+      tip_approved_type:"Approved {type}", aria_select_name:"Select {name}",
+      hdr_no_warnings_group:"No warnings, bulk approval available", hdr_exceptions_group:"Exceptions, need individual review",
+      aria_select_timesheet_for:"Select timesheet for {name}",
+      tip_clock_use_fields:"Z_BSRV records start and end. Use the Start/End fields above, for the people this applies to.",
+      tip_closed_period_short:"Closed period",
+      aria_start_time_for:"Start time, {name}, {day}", aria_end_time_for:"End time, {name}, {day}",
+      sev_error:"ERROR", sev_warning:"WARNING", sev_info:"INFO",
+      text_no_allowances_week:"No allowances recorded this week. Per diems, kilometres and shift allowances are recorded here, against a project and a date.",
+      text_wage_type_label:"wage type {code}",
+      text_recorded_by_behalf:"Recorded by {name}, on behalf of the employee",
+      hint_allow_wage_type:"Wage type {code}, quantity in ANZHL, unit {unit}. No value is calculated here, payroll values it.",
+      text_nothing_staged_yet:"Nothing staged yet.",
+      text_nothing_recorded_behalf_week:"Nothing recorded on behalf of the team yet, this week.",
+      text_no_bonus_recorded:"No bonus recorded on this project yet.",
+      label_month_total:"Month total", label_week_total:"Week total",
+      n_warnings_no_block_one:"{n} warning, they don't block submission", n_warnings_no_block_other:"{n} warnings, they don't block submission",
+      label_deviation_justification:"Justification for the deviation from the expected total",
+      placeholder_justification_month:"One line is enough. Stays in the month's history.",
+      text_h_in_project:"{h} h in project", chip_warning_lower:"warning",
+      msg_day_approved_type:"{day} has an approved {type}.", msg_day_capacity_simple:"{day}'s capacity is {cap} h.",
+      badge_half_day:"half day",
+      text_no_hours_week_yet:"No hours recorded this week yet.", text_no_hours_month_yet:"No hours recorded this month yet.",
+      text_shortest_path:"Start with the shortest path.",
+      conf_hi:"high confidence", conf_mid:"medium confidence", conf_low:"low confidence",
+      tip_save_to_finish:"This already applies here; Save still reflects it in the database.",
+      placeholder_justification_week:"One line is enough. Stays in the week's history.",
+      chip_approved:"Approved",
+      note_pending_leave_conflict:"Pending leave request overlaps recorded hours", note_two_empty_days:"Two empty working days",
+      val_week_label_prefix:"Week {n}: {txt}",
+      link_resolve_move_hours:"resolve, move the hours", link_go_to_day:"go to day",
+      btn_shortcuts:"Shortcuts", aria_shortcuts:"Keyboard shortcuts",
+      btn_settings:"Settings", aria_settings:"Language settings",
+      nav_my_timesheet:"My Timesheet", nav_team:"Team (mass entry)",
+      nav_approval:"Approval (manager)", nav_cats:"CATS mapping",
+      aria_prev_week:"Previous week", aria_next_week:"Next week",
+      state_draft:"Draft", state_in_approval:"In approval, read-only",
+      btn_quick_add:"Quick add", btn_submit_week:"Submit week", btn_save:"Save",
+      kpi_recorded:"Recorded", kpi_in_project:"In project", kpi_validation:"Validation",
+      val_no_errors:"No errors",
+      n_errors_one:"{n} error", n_errors_other:"{n} errors",
+      n_messages_one:"{n} message", n_messages_other:"{n} messages",
+      n_weeks_one:"{n} week", n_weeks_other:"{n} weeks",
+      n_empty_days_one:"{n} empty working day", n_empty_days_other:"{n} empty working days",
+      n_allowances_one:"{n} allowance", n_allowances_other:"{n} allowances",
+      n_records_generated_one:"{n} record generated", n_records_generated_other:"{n} records generated",
+      n_people_one:"{n} person", n_people_other:"{n} people",
+      n_entries_one:"{n} entry", n_entries_other:"{n} entries",
+      n_suggestions_review_one:"{n} suggestion to review", n_suggestions_review_other:"{n} suggestions to review",
+      btn_submit_month:"Submit month", btn_month_submitted:"Month submitted",
+      btn_week_submitted:"Week submitted", chip_in_approval:"In approval",
+      kextra_absences:"{h} h absences deducted", kextra_month_prefix:"{weeks} this month",
+      n_selected_one:"{n} selected", n_selected_other:"{n} selected",
+      lines_staged_suffix_one:"line staged", lines_staged_suffix_other:"lines staged", h_staged_suffix:"h staged",
+      hdr_week_entries:"Week entries", aria_view:"View", btn_grid:"Grid", btn_calendar:"Calendar",
+      hdr_how_it_works:"How it works?",
+      how_step1:"Create or select the project", how_step2:"Enter the hours",
+      how_step3:"Validate", how_step4:"Save or submit",
+      aria_collapse_how:"Collapse how it works", aria_expand_how:"Expand how it works",
+      legend_over:"Total per day: over capacity", legend_empty:"Empty working day",
+      legend_unavailable:"Not available (absence or non-working day)", legend_submitted:"Week already submitted",
+      btn_add_row:"Add row", btn_copy_week:"Copy previous week", btn_apply_template:"Apply template",
+      hint_grid_entry:"Accepts 1.5 · 1:30 · 90m. Enter moves down, Tab moves across.",
+      hint_calendar:"Click an empty slot to log time that day. Absences and public holidays are not editable.",
+      hdr_validation_messages:"Validation messages", hdr_allowances:"Allowances",
+      btn_add_allowance:"Add allowance",
+      privacy_allowances:"Per diems, kilometres and shift allowances are recorded against a project and a date, as quantity and unit. No value is calculated here. The project bonus is the exception: it carries an amount and only the project owner records it.",
+      aria_collapse_suggestions:"Collapse suggestions", aria_expand_suggestions:"Expand suggestions",
+      aria_collapse_allowances:"Collapse allowances", aria_expand_allowances:"Expand allowances",
+      hdr_suggestions:"Suggestions this week", btn_accept_high_confidence:"Accept high-confidence ones",
+      privacy_suggestions_intro:"Nothing enters the timesheet without confirmation.",
+      btn_data_collected:"What's collected and where it's stored",
+      hdr_specmap:"How this prototype maps to the specification",
+      text_specmap_intro:"Each screen below corresponds to a section of the specification document, so refinement with the development team happens on the same vocabulary.",
+      spec_e1:"Weekly grid with inline editing, day and row totals, copy week",
+      spec_e2:"Calendar view with project blocks and external events to convert",
+      spec_e3:"Quick add with natural language and correctable chips",
+      spec_e4:"Suggestions with reason, confidence level and explicit action",
+      spec_e5:"Entry detail with budget context and history",
+      spec_e6:"Three-severity validation and summary before submission",
+      spec_e7:"Bulk approval with exceptions singled out",
+      spec_e10:"Absences from the Leave Request, day blocking and partial capacity",
+      spec_e11:"Conversational assistant with confirmation before saving",
+      spec_e12:"Allowances against a project, wage type and quantity, bonus with an amount",
+      spec_e13:"Start and end by data entry profile, derived from IT0001",
+      spec_e14:"Team leader mass entry with partial save and on-behalf-of trace",
+      aria_expand_already:"Expand already recorded", aria_collapse_already:"Collapse already recorded",
+      hdr_already_recorded:"Already recorded this week", hdr_already_allow:"Allowances recorded this week",
+      chip_readonly:"Read-only",
+      hint_already:"From each person's own sheet or an earlier mass entry, plus whatever is staged below but not yet saved. Amber at 8h, red past it.",
+      hint_already_allow:"Allowances already saved for this team this week, from each person's own sheet or an earlier mass entry.",
+      tab_hours:"Hours", tab_allowances:"Allowances", tab_bonus:"Bonus",
+      hdr_team:"Team", hdr_fill_several:"Fill several people at once",
+      label_duration:"Duration", label_start_time:"Start time", label_end_time:"End time", label_days:"Days",
+      btn_apply_selected:"Apply to selected",
+      btn_save_staged_entries:"Save staged entries", btn_clear:"Clear",
+      hint_mass_save:"Saving is partial. Lines that fail stay on screen with the reason. Duration fills people on a duration profile, Start/End fills people on Z_BSRV, in the same click.",
+      hdr_allowances_selected:"Allowances for selected people",
+      label_wage_type:"Wage type", label_quantity:"Quantity", label_note:"Note",
+      placeholder_note_required:"Required for this allowance",
+      btn_stage_selected:"Stage for selected", btn_save_staged_allowances:"Save staged allowances",
+      hint_mass_allow:"Billed to the Project picked at the top of the screen, the same one Hours uses. The bonus is recorded separately, in the Bonus tab.",
+      hdr_project_bonus:"Project bonus", label_amount_eur:"Amount, EUR", label_reason:"Reason",
+      placeholder_bonus_reason:"Go-live weekend, payroll cutover",
+      btn_record_approve_selected:"Record and approve for selected",
+      privacy_bonus:"The bonus is the only allowance the employee does not record. The project owner defines the amount and approves in the same act, because the project carries the cost. The amount lives in a customer field, since CATSDB is a quantity structure.",
+      hdr_recorded_on_behalf:"Recorded on behalf",
+      privacy_recorded_on_behalf:"Every line keeps CREATED_BY and ON_BEHALF_OF. There is no self-confirmation step: the employee sees the entry marked as recorded by the leader, which informs without blocking. On the CATS side the submitting user still lands in ERNAM.",
+      kpi_selected:"Selected", kpi_staged_not_saved:"Staged, not saved", kpi_recorded_on_behalf:"Recorded on behalf",
+      label_project:"Project", label_acting_as:"Acting as",
+      chip_up_to_date:"Up to date", chip_save_to_finish:"Save to finish",
+      btn_select_no_warnings:"Select the 4 without warnings", chip_project_team:"Project team", btn_approve_selected:"Approve selected",
+      text_approval_sub:"A different person's queue, not your own week. It covers the people on Sofia's consulting projects (Banking, Retail, Airports) — nothing you submit under My Timesheet lands here.",
+      text_approval_sub_pt02:"A different person's queue, not your own week. It covers the people on Patrícia's facilities projects (Hospital campus, Airport terminal) — nothing you submit under My Timesheet lands here.",
+      kpi_pending_approval:"Pending approval", kpi_hours_submitted:"Hours submitted",
+      kpi_with_warnings:"With warnings", kpi_deviation_from_plan:"Deviation from plan",
+      hdr_team_allocated:"Team allocated to my projects", chip_integrates:"Integrates with My Inbox and SAP Task Center",
+      th_employee:"Employee", th_total:"Total", th_deviation:"Deviation", th_status:"Status",
+      aria_select_all:"Select all",
+      hint_bulk_approval:"Bulk approval is only available for rows without warnings. Rejection requires a reason, per the SAP standard.",
+      label_cats_header:"From the interface to CATS", chip_annex_a:"Annex A of the specification",
+      kpi_recording_target:"Recording target", kpi_assistance_layer:"Assistance layer",
+      kpi_direct_table_write:"Direct table write", val_never:"Never", kpi_customer_fields:"Customer fields",
+      hdr_state_chain:"State chain and transfer",
+      step_draft:"Draft", step_draft_sub:"BTP only",
+      step_saved:"Saved", step_saved_sub:"CATSDB, in process",
+      step_in_approval:"In approval", step_in_approval_sub:"released, STATUS",
+      step_approved:"Approved", step_approved_sub:"APNAM, APDAT",
+      step_posted:"Posted", step_posted_sub:"CATA, CAT5, CAT7, CAT9",
+      rule_1:"From <strong>In approval</strong> onward, editing is no longer a change. The correction creates a new record pointing to the original via <span class=\"num\">REFCOUNTER</span>, and goes back through approval.",
+      rule_2:"Cell locking reflects what has already been transferred, not just what has been approved. The transfer runs as a job, so the interface shows the date of the next cycle instead of pretending it's instant.",
+      hdr_field_mapping:"Field-by-field mapping", chip_cats_or_btp:"CATS, BTP or customer field",
+      th_interface_element:"Interface element", th_sap_concept:"SAP concept", th_field:"Field", th_where_lives:"Where it lives",
+      hdr_cats_records:"CATS records generated from the filled week", aria_format:"Format",
+      btn_table:"Table", btn_api_payload:"API payload",
+      hint_cats_table:"Generated live from the grid on the My Timesheet screen. LTXA1 is truncated to 40 characters, the field's real limit.",
+      assistant_fab:"Assistant", assistant_title:"Assistant", chip_joule_pattern:"Joule pattern",
+      btn_close:"Close", aria_close_assistant:"Close the assistant",
+      placeholder_chat:"2h BNK payroll testing yesterday", btn_send:"Send",
+      jfoot_text:"Never saves without confirmation. Entries created here are marked with origin <span class=\"num\">Joule</span> and go through the same validations.",
+      aria_dictate:"Dictate by voice",
+      /* Assistant chat content: greeting, quick-reply chips and every bot_*
+         reply botSay/botCard send to #jlog. Kept apart from the rest of the
+         dictionary only because there's so much of it - these were the one
+         corner the original i18n pass (toasts, validation messages, static
+         chrome) never reached, so the assistant kept replying in English
+         (and, in a couple of spots, in hardcoded Portuguese) regardless of
+         the language picked in Settings. */
+      bot_greeting:"Hi {name}! I can log hours, for you or for the team, check the week, sort out absences, approve timesheets, or just take you to the right screen. What do you need?",
+      bot_greeting_1:"Hey! What do you need, logging hours, checking the week, or something else?",
+      bot_greeting_2:"Hi there. Tell me what you need and I'll sort it.",
+      bot_greeting_3:"Hello! Hours to log, or something to check?",
+      chip_confirmed:"confirmed", chip_cancelled:"cancelled",
+      bot_cancelled_no_save:"No problem, I didn't save anything.",
+      bot_week_summary:"You have {tot} h recorded of {exp} h expected, already with absences deducted. ",
+      bot_week_errors_block_one:"{n} error blocks submission.", bot_week_errors_block_other:"{n} errors block submission.",
+      bot_week_no_errors_submit:"No errors, you can submit.",
+      bot_absences_intro:"These are this week's absences, from the Leave Request. Days with an approved full-day absence don't accept time entries.",
+      bot_help_text:"A few things I can do: log your hours (<span class=\"num\">2h BNK payroll testing yesterday</span>), log for someone on your team (<span class=\"num\">4h for João today</span>), check the week or your absences, copy last week, apply high-confidence suggestions, submit the week, approve timesheets, or jump to Team, Approval or CATS mapping. Just say it in plain language.",
+      bot_switched_to:"Switched to {screen}.",
+      bot_suggestions_available:"You have {n} suggestions to review in the side panel. I can apply the high-confidence ones, if you'd like.",
+      bot_no_suggestions:"No suggestions to review.",
+      bot_no_high_conf:"I don't have any pending high-confidence suggestions.",
+      bot_confirm_apply_suggestions:"Confirm applying these suggestions?", btn_apply:"Apply",
+      bot_suggestions_applied:"{n} suggestions applied. ",
+      bot_copy_week_offer:"I can bring in last week's structure, without durations.",
+      label_action:"Action", bot_copy_rows_value:"copy last week's rows",
+      label_durations:"Durations", bot_stay_zero_value:"stay at zero", btn_copy:"Copy",
+      bot_copy_week_done:"Done. The rows are created, durations still need filling in.",
+      bot_week_already_submitted:"The week is already submitted and in approval.",
+      bot_cant_submit_yet:"I can't submit yet. {reason}",
+      bot_confirm_submit_week:"Confirm submitting week {num}?",
+      label_expected:"Expected", label_status_after_submit:"Status after submitting",
+      bot_week_submitted_msg:"Week submitted. It's now in approval with the project manager.",
+      bot_week_locked:"The week is already submitted, I can't change it. Want to see something else?",
+      bot_day_absence_no_alt:"{day} has an approved {type} and there's no other day with free capacity. I didn't record anything.",
+      bot_day_absence_suggest:"{day} has an approved {type}, so it doesn't accept hours. I suggest {alt}.",
+      bot_day_closed:"{day} falls in a closed period, it can't take new hours. I didn't record anything.",
+      bot_day_abs_cap:"{day} has an approved {type}.", bot_day_capacity:"{day}'s capacity is {cap} h.",
+      bot_hours_left_suffix:" Only {left} h available, I didn't record anything.",
+      bot_no_hours_suffix:" No hours available on this day, I didn't record anything.",
+      bot_confirm_entry:"Confirm this entry?", label_receiver_object:"Receiver object",
+      bot_receiver_pep:"PEP {code}", bot_receiver_cost_center:"Cost center {code}",
+      bot_desc_tbd:"(to be filled in)", bot_entry_saved:"{dur} h saved on {day}, {code}. ",
+      bot_every_day_blocked:"Every day in that range has an approved absence, falls in a closed period, or doesn't have room for that much. I didn't record anything.",
+      bot_skip_absence_closed:"{days} (approved absence or closed period)", bot_skip_over_capacity:"{days} (over capacity)",
+      bot_days_skipped_suffix:" ({parts} skipped)", label_duration_per_day:"Duration per day",
+      bot_entry_saved_days_one:"{dur} h saved on {n} day ({total} h total), {code}. ",
+      bot_entry_saved_days_other:"{dur} h saved on {n} days ({total} h total), {code}. ",
+      bot_week_capacity_full:"Every working day this week is already at capacity.",
+      bot_month_capacity_full:"Every working day this month is already at capacity.",
+      bot_filled_saved_one:"{total} h saved across {n} day, {code}. ", bot_filled_saved_other:"{total} h saved across {n} days, {code}. ",
+      bot_filled_saved_month_one:"{total} h saved across {n} day, {code}, this month. ",
+      bot_filled_saved_month_other:"{total} h saved across {n} days, {code}, this month. ",
+      bot_cant_stage:"Can't stage that: {list}.", bot_week_already_approved:"{name} (week already approved)",
+      label_people:"People", label_time:"Time", label_duration_each:"Duration each", label_skipped:"Skipped",
+      bot_confirm_register_staging:"Register this on staging area?", btn_register:"Register",
+      bot_staged_saved:"Registered on staging area for {names}, {days}, {code}. Click {save} to finish.",
+      bot_staged_nothing:"Nothing was actually recorded.",
+      bot_staged_not_saved_suffix:" {names} couldn't take it this way (not allocated to {code}, wrong profile for that field, absence, or closed period), the reason is on the Team screen.",
+      bot_note_required:"{noteLabel} is required for {name}. What should it say?",
+      label_quantity_each:"Quantity each",
+      bot_staged_saved_allow:"Registered on staging area for {names}, {days}, {name}. Click {save} to finish.",
+      bot_staged_not_saved_allow_suffix:" {names} couldn't take it (not allocated to {code}, wrong company for that allowance, or closed period).",
+      bot_team_nobody_missing:"Nobody on {code}'s team has missing working days this week.",
+      bot_team_already_full:"{names} already at full capacity this week, on {code}'s team.",
+      bot_team_person_not_found:"I couldn't find anyone called \"{name}\" on {code}'s team.",
+      bot_confirm_fill_team:"Fill in these missing days up to each person's capacity?",
+      btn_fill_and_register:"Fill in and register",
+      bot_team_filled_saved:"Filled in and registered on staging area for {names}. Click {save} to finish.",
+      bot_team_filled_nothing:"Nothing was recorded.",
+      bot_team_filled_not_saved_suffix:" {names} couldn't take it, the reason is on the Team grid.",
+      bot_approval_ask_who:"Tell me who to approve, a name, or “approve everyone” for every timesheet without exceptions.",
+      bot_approval_nothing:"Nothing to approve there, either everything's already approved or what's left has an exception that needs individual review.",
+      bot_confirm_approve_all:"Approve these {n} timesheets, no exceptions?", btn_approve_all:"Approve all",
+      bot_approved_all_msg:"{n} timesheets approved. Exceptions remain for individual review.",
+      bot_already_approved:"{name}'s timesheet is already approved.",
+      bot_has_exception:"{name}'s timesheet has an exception ({note}) and needs individual review on the Approval screen, that one can't be bulk-approved.",
+      bot_confirm_approve_one:"Approve {name}'s timesheet?", label_in_project:"In project", btn_approve:"Approve",
+      bot_approved_one_msg:"{name}'s timesheet approved.",
+      bot_parse_failed:"I couldn't understand what to record. Write the duration and the project, for example <span class=\"num\">2h BNK payroll testing yesterday</span>. I can also show the week's status or your absences.",
+      bot_parse_failed_generic:"I didn't catch all the details of that entry. Could you write it another way?",
+      bot_which_project:"Which project are those hours for?",
+      bot_team_not_found:"couldn't find \"{name}\" on {code}'s team ({leader}). If they're on another project or with another leader, change the \"Acting as\" or \"Project\" selector at the top of the Team screen first",
+      bot_team_who_unclear:"couldn't tell who this is about", bot_team_day_unclear:"couldn't tell the day",
+      bot_team_amount_unclear:"couldn't tell {amount}", label_the_hours:"the hours", label_the_quantity:"the quantity",
+      bot_also_unrecognized_wage_type:"I also didn't recognize the wage type.",
+      chip_hours_i_have:"How many hours do I have?", chip_my_absences:"My absences", chip_bnk_example:"2h BNK testing yesterday",
+      chip_submit_week:"Submit the week", chip_submit_month:"Submit the month", chip_copy_last_week:"Copy last week",
+      chip_apply_high_conf:"Apply the high-confidence ones", chip_help:"Help",
+      dlg_add_allowance_title:"Add allowance", chip_wage_type:"Wage type", label_allowance:"Allowance", label_day:"Day",
+      btn_cancel:"Cancel", btn_record_allowance:"Record allowance",
+      dlg_quick_add_title:"Quick add", label_write_natural:"Write in natural language",
+      placeholder_quick_nl:"3h BNK requirements analysis yesterday", chip_waiting_text:"waiting for text",
+      text_quick_hint:"Each resolved field can be corrected. If the text isn't recognized, it goes into the description and nothing is invented.",
+      btn_save_entry:"Save entry",
+      dlg_entry_detail_title:"Entry detail", label_project_wbs:"Project and WBS",
+      label_start:"Start", label_end:"End", label_activity_type:"Activity type", label_description:"Description",
+      placeholder_description:"Required for project entries. The first 40 characters go to LTXA1",
+      placeholder_description_optional:"Optional for internal entries. If filled in, the first 40 characters go to LTXA1",
+      label_project_effort:"Project effort, actual vs. planned",
+      label_origin:"Origin", val_manual:"Manual", label_created_by:"Created by", label_last_changed:"Last changed",
+      btn_back:"Back", btn_submit:"Submit",
+      dlg_my_data_title:"My data", text_data_intro:"To propose entries, the app only uses metadata, at project level:",
+      row_calendar_events:"Corporate calendar events", row_tickets_handled:"Tickets handled",
+      row_repos_activity:"Repositories with activity", row_content_emails:"Content of emails, files or screenshots",
+      row_raw_timeline:"Raw timeline retention",
+      chip_metadata_only:"metadata only", chip_project_level:"project level", chip_never_collected:"never collected",
+      val_14_days:"14 days", chip_or_until_confirmed:"or until confirmed",
+      text_data_footer:"This timeline is visible only to you. The organization only sees the timesheet entries you submit. Legal basis and impact assessment to be validated with the DPO before the pilot.",
+      btn_delete_timeline:"Delete timeline",
+      dlg_shortcuts_title:"Keyboard shortcuts",
+      row_open_close_assistant:"Open and close the assistant", row_new_quick_add:"New quick add",
+      row_copy_previous_week:"Copy previous week", row_prev_next_week:"Previous and next week",
+      row_confirm_cell:"Confirm cell and move down", row_show_list:"Show this list"
+    },
+    pt: {
+      brand_title:"Registo de Horas", brand_subtitle:"Protótipo Fiori",
+      capture_on:"Sugestões ativas, linha do tempo privada", capture_off:"Captura em pausa",
+      aria_it0001:"Empresa do colaborador, a partir do IT0001",
+      aria_project_billing:"Projeto a faturar e a alocar aos lançamentos em massa", aria_leader_scope:"Líder e âmbito",
+      aria_mass_entry_section:"Secção de lançamento em massa", label_approval_week37:"Aprovação de horas, semana 37",
+      label_week_n:"Semana {n}, {range} {y}", label_range_same_month:"{d1} a {d2} {month}", label_range_diff_month:"{d1} {m1} a {d2} {m2}",
+      status_approved:"Aprovada", status_pending:"Pedido pendente",
+      dlg_new_entry_title:"Novo lançamento", origin_suggested:"Sugerido", origin_copied:"Copiado",
+      dlg_submit_month_title:"Submeter {month} {y}", dlg_submit_week_title:"Submeter semana {n}",
+      ui_undo:"Desfazer", ui_resolve:"Resolver", ui_reopen:"Reabrir",
+      toast_bad_duration:"Não consegui ler “{v}”. Usa 1.5, 1:30 ou 90m.",
+      toast_only_available:" Só há {left} h disponíveis.", toast_no_hours_available:" Sem horas disponíveis neste dia.",
+      toast_bad_clock:"Não consegui ler “{v}”. Usa 08:00 ou 8.",
+      toast_row_removed:"Linha removida.",
+      toast_month_submitted_no_rows:"Este mês já está submetido, não é possível adicionar mais linhas.",
+      toast_all_projects_used_month:"Todos os projetos disponíveis para esta empresa já têm linha este mês.",
+      toast_no_earlier_months:"Sem meses de exemplo anteriores.", toast_no_later_months:"Sem meses de exemplo seguintes.",
+      toast_sugg_blocked_absence:"{day} tem uma ausência aprovada, a sugestão não pode ser aplicada.",
+      toast_suggestion_accepted:"Sugestão aceite em {day}.",
+      toast_suggestion_dismissed:"Sugestão dispensada. O padrão não voltará a ser proposto.",
+      toast_absence_approved_conflict:"Ausência aprovada em {day}. As {h} h registadas nesse dia estão agora em conflito.",
+      toast_absence_approved_no_conflict:"Ausência aprovada em {day}. O dia deixou de estar disponível para lançamentos.",
+      toast_hours_moved:"{h} h movidas de {from} para {to}.",
+      toast_hours_removed_no_capacity:"{h} h removidas de {day}, nenhum dia tinha capacidade livre.",
+      toast_allowance_removed:"{name} removido.",
+      toast_week_submitted_no_allow_change:"A semana está submetida, os abonos não podem ser alterados.",
+      toast_week_closed_period:"Esta semana cai num período fechado.",
+      toast_qty_must_be_positive:"A quantidade tem de ser um número acima de zero.",
+      toast_allowance_recorded:"{name} registado em {day}.",
+      toast_bad_number:"Não consegui ler “{v}”.",
+      toast_capacity_on_day:"A capacidade de {name} é {cap} h em {day}.",
+      toast_select_person_first:"Seleciona primeiro pelo menos uma pessoa.",
+      toast_give_duration_or_clock:"Indica uma duração, ou uma hora de início e fim.",
+      toast_pick_a_day:"Escolhe pelo menos um dia.",
+      toast_cells_filled:"{n} células preenchidas para {people} pessoas. Ainda não está gravado, revê a grelha primeiro.",
+      cells_skipped_field_one:" {n} célula ignorada, precisa do outro campo para esse perfil.",
+      cells_skipped_field_other:" {n} células ignoradas, precisam do outro campo para esse perfil.",
+      cells_skipped_capacity_one:" {n} célula ignorada, acima da capacidade diária dessa pessoa.",
+      cells_skipped_capacity_other:" {n} células ignoradas, acima da capacidade diária dessa pessoa.",
+      toast_team_entries_partial:"{saved} lançamentos registados para {who}. {left} ficaram no ecrã com o motivo. Clica em Gravar para terminar.",
+      toast_team_entries_all:"{saved} lançamentos registados para {who}, em nome deles. Clica em Gravar para terminar.",
+      toast_team_entries_none:"Nada foi registado. Cada linha tem um motivo ao lado.",
+      toast_give_qty_positive:"Indica uma quantidade acima de zero.",
+      toast_note_required_for:"{note} é obrigatório para {name}.",
+      allow_lines_staged_one:"{n} linha de abono em staging para {people} pessoas. Ainda não está gravado.",
+      allow_lines_staged_other:"{n} linhas de abono em staging para {people} pessoas. Ainda não está gravado.",
+      toast_allow_skipped_company:" {n} ignorados, o abono de turno não se aplica à empresa deles.",
+      toast_allow_skipped_project:" {n} ignorados, não alocados a {code}.",
+      toast_nothing_staged:"Nada em staging.",
+      allow_lines_recorded_one:"{n} linha de abono registada, em nome deles. Clica em Gravar para terminar.",
+      allow_lines_recorded_other:"{n} linhas de abono registadas, em nome deles. Clica em Gravar para terminar.",
+      toast_nothing_to_save:"Nada para gravar.", toast_changes_saved:"Alterações gravadas.",
+      toast_amount_must_be_positive:"O montante tem de ser um número acima de zero.",
+      toast_bonus_reason_required:"O bónus precisa de um motivo. É o único rasto de porque é que o projeto suportou este custo.",
+      toast_none_allocated:"Nenhuma das pessoas selecionadas está alocada a {code}.",
+      toast_bonus_recorded:"Bónus de {amount} EUR registado para {names}, aprovado no mesmo ato.",
+      toast_bonus_none_recorded:"Nada foi efetivamente registado.",
+      toast_bonus_skipped_ineligible:" {names} ignorados, não alocados a {code}.",
+      toast_bonus_skipped_closed:" {names} ignorados, todos os dias desta semana caem num período fechado.",
+      toast_week_submitted_no_rows:"Esta semana já está submetida, não é possível adicionar mais linhas.",
+      toast_all_projects_used_week:"Todos os projetos disponíveis para esta empresa já têm linha esta semana.",
+      toast_copy_week_done:"Estrutura da semana anterior copiada, sem durações. {n} linhas novas.",
+      toast_copy_week_none:"Todas as linhas da semana anterior já estão presentes.",
+      toast_no_earlier_weeks:"Sem semanas de exemplo anteriores.", toast_no_later_weeks:"Sem semanas de exemplo seguintes.",
+      toast_template_applied:"Modelo de alocação aplicado aos dias úteis.",
+      toast_it0001_changed:"O IT0001 passa a ler {bukrs}. O ZTIME_COMPANY_CFG mapeia isso para {code}: {fields}.",
+      toast_week_submitted_locked:"A semana está submetida, não pode ser alterada.",
+      toast_day_absence_blocked:"{day} tem uma ausência aprovada, não aceita lançamentos de horas.",
+      toast_day_closed_period:"{day} cai num período fechado, não pode receber novas horas.",
+      toast_hours_recorded:"{h} h registadas em {code}, {day}.",
+      toast_entry_added:"Lançamento adicionado.",
+      toast_row_exists_week:"{code} já tem uma linha esta semana. Remove ou junta primeiro.",
+      toast_entry_updated:"Lançamento atualizado.",
+      toast_row_exists_month:"{code} já tem uma linha este mês. Remove ou junta primeiro.",
+      weeks_submitted_approval_one:"{n} semana submetida para aprovação. Clica em Gravar para terminar.",
+      weeks_submitted_approval_other:"{n} semanas submetidas para aprovação. Clica em Gravar para terminar.",
+      toast_week_submitted_approval:"Semana {n} submetida para aprovação. Clica em Gravar para terminar.",
+      toast_high_conf_applied:"{n} sugestões de alta confiança aplicadas. As de confiança média e baixa continuam por rever.",
+      toast_timeline_deleted:"Linha do tempo em bruto eliminada. As sugestões pendentes desapareceram com ela.",
+      toast_timesheets_approved:"{n} folhas de horas aprovadas numa só ação. As exceções continuam por rever.",
+      toast_voice_error:"Erro na entrada de voz: {err}",
+      toast_staged_entries_cleared:"Lançamentos em staging limpos. Nada tinha sido gravado.",
+      toast_staged_allow_cleared:"Abonos em staging limpos. Nada tinha sido gravado.",
+      val_day_exceeds_24h:"O total de {day} excede 24 horas.",
+      val_desc_required:"Lançamentos de projeto precisam de uma descrição: {code}.",
+      val_absence_move_hours:"{day} tem uma {type} aprovada. As {h} h registadas precisam de sair desse dia.",
+      val_partial_absence_capacity:"{day} tem uma ausência parcial aprovada. A capacidade do dia é {cap} h e estão registadas {tot} h.",
+      val_day_capacity:"A capacidade de {day} é {cap} h; estão registadas {tot} h.",
+      val_pending_leave_conflict:"{day} tem um pedido de ausência pendente e horas registadas. Se o pedido for aprovado, estas horas entram em conflito.",
+      val_day_empty:"{day} está vazio.",
+      val_week_below_expected:"A semana tem {tot} h registadas; o total esperado com as ausências deduzidas é {expect} h.",
+      val_closed_period:"{day} cai no período {ym}, fechado para {bukrs}. Reabrir é uma ação de RH.",
+      val_overlapping_windows:"{day} tem janelas horárias sobrepostas: {t1} a {t2} e {t3} a {t4}.",
+      val_window_needs_both:"{day}, {code}: a janela precisa de início e fim.",
+      val_allow_note_needed:"{name} em {day} precisa de {noteLabel}.",
+      val_allow_closed_period:"{name} em {day} cai num período fechado.",
+      val_allow_no_amount:"{name} em {day} não tem montante.",
+      val_allow_no_qty:"{name} em {day} não tem quantidade.",
+      n_suggestions_to_review2_one:"{n} sugestão ainda por rever no painel lateral.",
+      n_suggestions_to_review2_other:"{n} sugestões ainda por rever no painel lateral.",
+      suggestions_discarded_one:"{n} sugestão dispensada por cair em dias com ausência aprovada.",
+      suggestions_discarded_other:"{n} sugestões dispensadas por caírem em dias com ausência aprovada.",
+      th_project_wbs_activity:"Projeto, WBS e atividade", row_total_per_day:"Total por dia", btn_remove:"Remover",
+      tip_approved_partial_absence:"Ausência parcial aprovada, capacidade de {h} h neste dia",
+      btn_copy_last_week:"Copiar semana passada", btn_add_first_project:"Adicionar o primeiro projeto",
+      btn_resume_suggestions:"Retomar sugestões", btn_simulate_approval:"Simular aprovação",
+      tip_bonus_remove_restricted:"O bónus é removido pelo dono do projeto, no ecrã da equipa.",
+      text_no_records_to_generate:"Sem horas nem abonos esta semana, por isso não há registos a gerar.",
+      voice_not_supported:"Entrada de voz não suportada neste browser",
+      tip_absence_not_available:"{type} aprovada, dia indisponível para lançamentos",
+      text_desc_required:"Descrição obrigatória", text_no_description:"Sem descrição",
+      aria_remove_row:"Remover linha {name}",
+      tip_period_closed:"O período {ym} está fechado para {bukrs}. Reabrir é uma ação de RH.",
+      placeholder_desc_required_once:"Descrição (obrigatória assim que há horas lançadas)", placeholder_description_short:"Descrição",
+      text_absence_generic:"ausência",
+      tip_approved_type:"{type} aprovada", aria_select_name:"Selecionar {name}",
+      hdr_no_warnings_group:"Sem avisos, aprovação em massa disponível", hdr_exceptions_group:"Exceções, precisam de revisão individual",
+      aria_select_timesheet_for:"Selecionar folha de horas de {name}",
+      tip_clock_use_fields:"O Z_BSRV regista início e fim. Usa os campos Início/Fim acima, para as pessoas a quem se aplica.",
+      tip_closed_period_short:"Período fechado",
+      aria_start_time_for:"Hora de início, {name}, {day}", aria_end_time_for:"Hora de fim, {name}, {day}",
+      sev_error:"ERRO", sev_warning:"AVISO", sev_info:"INFO",
+      text_no_allowances_week:"Sem abonos registados esta semana. As ajudas de custo, quilómetros e abonos de turno são registados aqui, contra um projeto e uma data.",
+      text_wage_type_label:"tipo de rúbrica {code}",
+      text_recorded_by_behalf:"Registado por {name}, em nome do colaborador",
+      hint_allow_wage_type:"Tipo de rúbrica {code}, quantidade em ANZHL, unidade {unit}. Nenhum valor é calculado aqui, o payroll valoriza.",
+      text_nothing_staged_yet:"Nada em staging ainda.",
+      text_nothing_recorded_behalf_week:"Nada registado em nome da equipa ainda, esta semana.",
+      text_no_bonus_recorded:"Nenhum bónus registado neste projeto ainda.",
+      label_month_total:"Total do mês", label_week_total:"Total da semana",
+      n_warnings_no_block_one:"{n} aviso, não bloqueia a submissão", n_warnings_no_block_other:"{n} avisos, não bloqueiam a submissão",
+      label_deviation_justification:"Justificação para o desvio face ao total esperado",
+      placeholder_justification_month:"Uma linha chega. Fica no histórico do mês.",
+      text_h_in_project:"{h} h em projeto", chip_warning_lower:"aviso",
+      msg_day_approved_type:"{day} tem uma {type} aprovada.", msg_day_capacity_simple:"A capacidade de {day} é {cap} h.",
+      badge_half_day:"meio dia",
+      text_no_hours_week_yet:"Ainda sem horas registadas esta semana.", text_no_hours_month_yet:"Ainda sem horas registadas este mês.",
+      text_shortest_path:"Começa pelo caminho mais curto.",
+      conf_hi:"confiança alta", conf_mid:"confiança média", conf_low:"confiança baixa",
+      tip_save_to_finish:"Isto já está em vigor; o Save só reflete na base de dados.",
+      placeholder_justification_week:"Uma linha chega. Fica no histórico da semana.",
+      chip_approved:"Aprovada",
+      note_pending_leave_conflict:"Pedido de ausência pendente sobrepõe-se a horas registadas", note_two_empty_days:"Dois dias úteis vazios",
+      val_week_label_prefix:"Semana {n}: {txt}",
+      link_resolve_move_hours:"resolver, mover as horas", link_go_to_day:"ir para o dia",
+      btn_shortcuts:"Atalhos", aria_shortcuts:"Atalhos de teclado",
+      btn_settings:"Definições", aria_settings:"Definições de idioma",
+      nav_my_timesheet:"A Minha Folha", nav_team:"Equipa (lançamento em massa)",
+      nav_approval:"Aprovação (gestor)", nav_cats:"Mapeamento CATS",
+      aria_prev_week:"Semana anterior", aria_next_week:"Semana seguinte",
+      state_draft:"Rascunho", state_in_approval:"Em aprovação, só leitura",
+      btn_quick_add:"Adicionar rápido", btn_submit_week:"Submeter semana", btn_save:"Gravar",
+      kpi_recorded:"Registado", kpi_in_project:"Em projeto", kpi_validation:"Validação",
+      val_no_errors:"Sem erros",
+      n_errors_one:"{n} erro", n_errors_other:"{n} erros",
+      n_messages_one:"{n} mensagem", n_messages_other:"{n} mensagens",
+      n_weeks_one:"{n} semana", n_weeks_other:"{n} semanas",
+      n_empty_days_one:"{n} dia útil vazio", n_empty_days_other:"{n} dias úteis vazios",
+      n_allowances_one:"{n} abono", n_allowances_other:"{n} abonos",
+      n_records_generated_one:"{n} registo gerado", n_records_generated_other:"{n} registos gerados",
+      n_people_one:"{n} pessoa", n_people_other:"{n} pessoas",
+      n_entries_one:"{n} lançamento", n_entries_other:"{n} lançamentos",
+      n_suggestions_review_one:"{n} sugestão a rever", n_suggestions_review_other:"{n} sugestões a rever",
+      btn_submit_month:"Submeter mês", btn_month_submitted:"Mês submetido",
+      btn_week_submitted:"Semana submetida", chip_in_approval:"Em aprovação",
+      kextra_absences:"{h} h de ausências deduzidas", kextra_month_prefix:"{weeks} este mês",
+      n_selected_one:"{n} selecionado", n_selected_other:"{n} selecionados",
+      lines_staged_suffix_one:"linha em staging", lines_staged_suffix_other:"linhas em staging", h_staged_suffix:"h em staging",
+      hdr_week_entries:"Lançamentos da semana", aria_view:"Vista", btn_grid:"Grelha", btn_calendar:"Calendário",
+      hdr_how_it_works:"Como funciona?",
+      how_step1:"Criar ou selecionar o projeto", how_step2:"Inserir as horas",
+      how_step3:"Validar", how_step4:"Guardar ou submeter",
+      aria_collapse_how:"Colapsar Como funciona", aria_expand_how:"Expandir Como funciona",
+      legend_over:"Total por dia: acima da capacidade", legend_empty:"Dia útil vazio",
+      legend_unavailable:"Indisponível (ausência ou dia não útil)", legend_submitted:"Semana já submetida",
+      btn_add_row:"Adicionar linha", btn_copy_week:"Copiar semana anterior", btn_apply_template:"Aplicar modelo",
+      hint_grid_entry:"Aceita 1.5 · 1:30 · 90m. Enter desce, Tab avança.",
+      hint_calendar:"Clica numa vaga para lançar horas nesse dia. Ausências e feriados não são editáveis.",
+      hdr_validation_messages:"Mensagens de validação", hdr_allowances:"Abonos",
+      btn_add_allowance:"Adicionar abono",
+      privacy_allowances:"Ajudas de custo, quilómetros e abonos de turno são registados contra um projeto e uma data, como quantidade e unidade. Não é calculado nenhum valor aqui. O bónus de projeto é a exceção: tem um montante e só o dono do projeto o regista.",
+      aria_collapse_suggestions:"Colapsar sugestões", aria_expand_suggestions:"Expandir sugestões",
+      aria_collapse_allowances:"Colapsar abonos", aria_expand_allowances:"Expandir abonos",
+      hdr_suggestions:"Sugestões desta semana", btn_accept_high_confidence:"Aceitar as de alta confiança",
+      privacy_suggestions_intro:"Nada entra na folha de horas sem confirmação.",
+      btn_data_collected:"O que é recolhido e onde é guardado",
+      hdr_specmap:"Como este protótipo se relaciona com a especificação",
+      text_specmap_intro:"Cada ecrã abaixo corresponde a uma secção do documento de especificação, para o refinamento com a equipa de desenvolvimento usar o mesmo vocabulário.",
+      spec_e1:"Grelha semanal com edição inline, totais por dia e por linha, copiar semana",
+      spec_e2:"Vista de calendário com blocos de projeto e eventos externos a converter",
+      spec_e3:"Adicionar rápido em linguagem natural com chips corrigíveis",
+      spec_e4:"Sugestões com motivo, nível de confiança e ação explícita",
+      spec_e5:"Detalhe do lançamento com contexto de orçamento e histórico",
+      spec_e6:"Validação em três níveis de gravidade e resumo antes da submissão",
+      spec_e7:"Aprovação em massa com exceções destacadas",
+      spec_e10:"Ausências vindas do Leave Request, bloqueio de dias e capacidade parcial",
+      spec_e11:"Assistente conversacional com confirmação antes de gravar",
+      spec_e12:"Abonos contra um projeto, tipo de rúbrica e quantidade, bónus com um montante",
+      spec_e13:"Início e fim conforme o perfil de lançamento, derivado do IT0001",
+      spec_e14:"Lançamento em massa pelo team leader, com gravação parcial e rasto em nome de",
+      aria_expand_already:"Expandir já registado", aria_collapse_already:"Colapsar já registado",
+      hdr_already_recorded:"Já registado esta semana", hdr_already_allow:"Abonos registados esta semana",
+      chip_readonly:"Só leitura",
+      hint_already:"Da folha de cada pessoa ou de um lançamento em massa anterior, mais o que está em staging abaixo mas ainda não gravado. Âmbar aos 8h, vermelho depois disso.",
+      hint_already_allow:"Abonos já gravados para esta equipa esta semana, da folha de cada pessoa ou de um lançamento em massa anterior.",
+      tab_hours:"Horas", tab_allowances:"Abonos", tab_bonus:"Bónus",
+      hdr_team:"Equipa", hdr_fill_several:"Preencher várias pessoas de uma vez",
+      label_duration:"Duração", label_start_time:"Hora de início", label_end_time:"Hora de fim", label_days:"Dias",
+      btn_apply_selected:"Aplicar aos selecionados",
+      btn_save_staged_entries:"Gravar lançamentos em staging", btn_clear:"Limpar",
+      hint_mass_save:"A gravação é parcial. As linhas que falham ficam no ecrã com o motivo. Duração preenche pessoas num perfil de duração, Início/Fim preenche pessoas em Z_BSRV, no mesmo clique.",
+      hdr_allowances_selected:"Abonos para as pessoas selecionadas",
+      label_wage_type:"Tipo de rúbrica", label_quantity:"Quantidade", label_note:"Nota",
+      placeholder_note_required:"Obrigatório para este abono",
+      btn_stage_selected:"Pôr em staging para os selecionados", btn_save_staged_allowances:"Gravar abonos em staging",
+      hint_mass_allow:"Faturado ao Projeto escolhido no topo do ecrã, o mesmo que Horas usa. O bónus é registado à parte, no separador Bónus.",
+      hdr_project_bonus:"Bónus de projeto", label_amount_eur:"Montante, EUR", label_reason:"Motivo",
+      placeholder_bonus_reason:"Fim de semana de go-live, corte de payroll",
+      btn_record_approve_selected:"Registar e aprovar para os selecionados",
+      privacy_bonus:"O bónus é o único abono que o colaborador não regista. O dono do projeto define o montante e aprova no mesmo ato, porque é o projeto que suporta o custo. O montante vive num campo de cliente, já que a CATSDB é uma estrutura de quantidades.",
+      hdr_recorded_on_behalf:"Registado em nome de",
+      privacy_recorded_on_behalf:"Cada linha mantém CREATED_BY e ON_BEHALF_OF. Não há passo de autoconfirmação: o colaborador vê o lançamento marcado como registado pelo líder, o que informa sem bloquear. Do lado do CATS, o utilizador que submete continua a ficar em ERNAM.",
+      kpi_selected:"Selecionados", kpi_staged_not_saved:"Em staging, não gravado", kpi_recorded_on_behalf:"Registado em nome de",
+      label_project:"Projeto", label_acting_as:"A atuar como",
+      chip_up_to_date:"Atualizado", chip_save_to_finish:"Gravar para terminar",
+      btn_select_no_warnings:"Selecionar os 4 sem avisos", chip_project_team:"Equipa do projeto", btn_approve_selected:"Aprovar selecionados",
+      text_approval_sub:"A fila de outra pessoa, não a tua própria semana. Cobre as pessoas nos projetos de consultoria da Sofia (Banking, Retail, Airports) — nada do que submetes em A Minha Folha aparece aqui.",
+      text_approval_sub_pt02:"A fila de outra pessoa, não a tua própria semana. Cobre as pessoas nos projetos de facilities da Patrícia (Hospital campus, Airport terminal) — nada do que submetes em A Minha Folha aparece aqui.",
+      kpi_pending_approval:"Pendente de aprovação", kpi_hours_submitted:"Horas submetidas",
+      kpi_with_warnings:"Com avisos", kpi_deviation_from_plan:"Desvio face ao plano",
+      hdr_team_allocated:"Equipa alocada aos meus projetos", chip_integrates:"Integra com My Inbox e SAP Task Center",
+      th_employee:"Colaborador", th_total:"Total", th_deviation:"Desvio", th_status:"Estado",
+      aria_select_all:"Selecionar tudo",
+      hint_bulk_approval:"A aprovação em massa só está disponível para linhas sem avisos. A rejeição exige um motivo, conforme o standard SAP.",
+      label_cats_header:"Da interface para o CATS", chip_annex_a:"Anexo A da especificação",
+      kpi_recording_target:"Destino do registo", kpi_assistance_layer:"Camada de apoio",
+      kpi_direct_table_write:"Escrita direta na tabela", val_never:"Nunca", kpi_customer_fields:"Campos de cliente",
+      hdr_state_chain:"Cadeia de estados e transferência",
+      step_draft:"Rascunho", step_draft_sub:"Só BTP",
+      step_saved:"Gravado", step_saved_sub:"CATSDB, em processo",
+      step_in_approval:"Em aprovação", step_in_approval_sub:"libertado, STATUS",
+      step_approved:"Aprovado", step_approved_sub:"APNAM, APDAT",
+      step_posted:"Contabilizado", step_posted_sub:"CATA, CAT5, CAT7, CAT9",
+      rule_1:"A partir de <strong>Em aprovação</strong>, editar deixa de ser uma alteração. A correção cria um novo registo que aponta para o original via <span class=\"num\">REFCOUNTER</span>, e volta a passar por aprovação.",
+      rule_2:"O bloqueio de células reflete o que já foi transferido, não só o que foi aprovado. A transferência corre como um job, por isso a interface mostra a data do próximo ciclo em vez de fingir que é instantâneo.",
+      hdr_field_mapping:"Mapeamento campo a campo", chip_cats_or_btp:"CATS, BTP ou campo de cliente",
+      th_interface_element:"Elemento de interface", th_sap_concept:"Conceito SAP", th_field:"Campo", th_where_lives:"Onde vive",
+      hdr_cats_records:"Registos CATS gerados a partir da semana preenchida", aria_format:"Formato",
+      btn_table:"Tabela", btn_api_payload:"Payload da API",
+      hint_cats_table:"Gerado ao vivo a partir da grelha do ecrã A Minha Folha. LTXA1 é truncado a 40 caracteres, o limite real do campo.",
+      assistant_fab:"Assistente", assistant_title:"Assistente", chip_joule_pattern:"Padrão Joule",
+      btn_close:"Fechar", aria_close_assistant:"Fechar o assistente",
+      placeholder_chat:"2h BNK teste de payroll ontem", btn_send:"Enviar",
+      jfoot_text:"Nunca grava sem confirmação. Os lançamentos criados aqui ficam marcados com origem <span class=\"num\">Joule</span> e passam pelas mesmas validações.",
+      aria_dictate:"Ditar por voz",
+      bot_greeting:"Olá, {name}! Posso registar horas, para ti ou para a equipa, consultar a semana, tratar de ausências, aprovar folhas de horas, ou levar-te diretamente ao ecrã certo. Em que posso ajudar?",
+      bot_greeting_1:"Olá! Em que posso ajudar: registar horas, consultar a semana, ou outra coisa?",
+      bot_greeting_2:"Olá. Diz-me o que precisas e eu trato disso.",
+      bot_greeting_3:"Olá! Horas para registar, ou algo para consultar?",
+      chip_confirmed:"confirmado", chip_cancelled:"cancelado",
+      bot_cancelled_no_save:"Sem problema, não gravei nada.",
+      bot_week_summary:"Tens {tot} h registadas de {exp} h esperadas, já com as ausências deduzidas. ",
+      bot_week_errors_block_one:"{n} erro bloqueia a submissão.", bot_week_errors_block_other:"{n} erros bloqueiam a submissão.",
+      bot_week_no_errors_submit:"Sem erros, já podes submeter.",
+      bot_absences_intro:"Estas são as ausências desta semana, vindas do pedido de férias/ausência. Dias com uma ausência de dia inteiro aprovada não aceitam lançamentos.",
+      bot_help_text:"Algumas coisas que posso fazer: registar as tuas horas (<span class=\"num\">2h BNK payroll testing yesterday</span>), registar para alguém da equipa (<span class=\"num\">4h for João today</span>), consultar a semana ou as ausências, copiar a semana anterior, aplicar as sugestões de maior confiança, submeter a semana, aprovar folhas de horas, ou ir para Equipa, Aprovação ou Mapeamento CATS. Escreve em linguagem normal.",
+      bot_switched_to:"Mudei para {screen}.",
+      bot_suggestions_available:"Tens {n} sugestões para rever no painel lateral. Posso aplicar as de maior confiança, se quiseres.",
+      bot_no_suggestions:"Sem sugestões para rever.",
+      bot_no_high_conf:"Não tenho nenhuma sugestão de alta confiança pendente.",
+      bot_confirm_apply_suggestions:"Confirmas aplicar estas sugestões?", btn_apply:"Aplicar",
+      bot_suggestions_applied:"{n} sugestões aplicadas. ",
+      bot_copy_week_offer:"Posso trazer a estrutura da semana anterior, sem durações.",
+      label_action:"Ação", bot_copy_rows_value:"copiar as linhas da semana anterior",
+      label_durations:"Durações", bot_stay_zero_value:"ficam a zero", btn_copy:"Copiar",
+      bot_copy_week_done:"Feito. As linhas estão criadas, as durações ainda precisam de ser preenchidas.",
+      bot_week_already_submitted:"A semana já está submetida e em aprovação.",
+      bot_cant_submit_yet:"Ainda não posso submeter. {reason}",
+      bot_confirm_submit_week:"Confirmas submeter a semana {num}?",
+      label_expected:"Esperado", label_status_after_submit:"Estado após submeter",
+      bot_week_submitted_msg:"Semana submetida. Está agora em aprovação com o gestor do projeto.",
+      bot_week_locked:"A semana já está submetida, não a posso alterar. Queres ver outra coisa?",
+      bot_day_absence_no_alt:"{day} tem uma {type} aprovada e não há outro dia com capacidade livre. Não registei nada.",
+      bot_day_absence_suggest:"{day} tem uma {type} aprovada, por isso não aceita horas. Sugiro {alt}.",
+      bot_day_closed:"{day} está num período fechado, não pode receber novas horas. Não registei nada.",
+      bot_day_abs_cap:"{day} tem uma {type} aprovada.", bot_day_capacity:"A capacidade de {day} é {cap} h.",
+      bot_hours_left_suffix:" Só há {left} h disponíveis, não registei nada.",
+      bot_no_hours_suffix:" Não há horas disponíveis nesse dia, não registei nada.",
+      bot_confirm_entry:"Confirmas este lançamento?", label_receiver_object:"Objeto recetor",
+      bot_receiver_pep:"PEP {code}", bot_receiver_cost_center:"Centro de custo {code}",
+      bot_desc_tbd:"(por preencher)", bot_entry_saved:"{dur} h gravadas em {day}, {code}. ",
+      bot_every_day_blocked:"Todos os dias desse intervalo têm uma ausência aprovada, caem num período fechado, ou não têm espaço para essa quantidade. Não registei nada.",
+      bot_skip_absence_closed:"{days} (ausência aprovada ou período fechado)", bot_skip_over_capacity:"{days} (acima da capacidade)",
+      bot_days_skipped_suffix:" ({parts} ignorados)", label_duration_per_day:"Duração por dia",
+      bot_entry_saved_days_one:"{dur} h gravadas em {n} dia ({total} h no total), {code}. ",
+      bot_entry_saved_days_other:"{dur} h gravadas em {n} dias ({total} h no total), {code}. ",
+      bot_week_capacity_full:"Todos os dias úteis desta semana já estão à capacidade.",
+      bot_month_capacity_full:"Todos os dias úteis deste mês já estão à capacidade.",
+      bot_filled_saved_one:"{total} h gravadas em {n} dia, {code}. ", bot_filled_saved_other:"{total} h gravadas em {n} dias, {code}. ",
+      bot_filled_saved_month_one:"{total} h gravadas em {n} dia, {code}, este mês. ",
+      bot_filled_saved_month_other:"{total} h gravadas em {n} dias, {code}, este mês. ",
+      bot_cant_stage:"Não consigo colocar isso em preparação: {list}.", bot_week_already_approved:"{name} (semana já aprovada)",
+      label_people:"Pessoas", label_time:"Horário", label_duration_each:"Duração de cada", label_skipped:"Ignorados",
+      bot_confirm_register_staging:"Colocar isto na área de preparação?", btn_register:"Registar",
+      bot_staged_saved:"Colocado em preparação para {names}, {days}, {code}. Clica em {save} para terminar.",
+      bot_staged_nothing:"Não foi registado nada.",
+      bot_staged_not_saved_suffix:" {names} não conseguiu(ram) desta forma (não alocado a {code}, perfil errado para esse campo, ausência, ou período fechado), o motivo está no ecrã Equipa.",
+      bot_note_required:"{noteLabel} é obrigatório para {name}. O que deve dizer?",
+      label_quantity_each:"Quantidade de cada",
+      bot_staged_saved_allow:"Colocado em preparação para {names}, {days}, {name}. Clica em {save} para terminar.",
+      bot_staged_not_saved_allow_suffix:" {names} não conseguiu(ram) (não alocado a {code}, empresa errada para esse abono, ou período fechado).",
+      bot_team_nobody_missing:"Ninguém na equipa de {code} tem dias úteis por preencher esta semana.",
+      bot_team_already_full:"{names} já está(ão) com a capacidade completa esta semana, na equipa de {code}.",
+      bot_team_person_not_found:"Não encontrei ninguém chamado \"{name}\" na equipa de {code}.",
+      bot_confirm_fill_team:"Preencher estes dias em falta até à capacidade de cada pessoa?",
+      btn_fill_and_register:"Preencher e registar",
+      bot_team_filled_saved:"Preenchido e colocado em preparação para {names}. Clica em {save} para terminar.",
+      bot_team_filled_nothing:"Não foi registado nada.",
+      bot_team_filled_not_saved_suffix:" {names} não conseguiu(ram), o motivo está na grelha da Equipa.",
+      bot_approval_ask_who:"Diz-me quem aprovar, um nome, ou “aprovar todos” para todas as folhas de horas sem exceções.",
+      bot_approval_nothing:"Não há nada para aprovar aí, ou já está tudo aprovado, ou o que resta tem uma exceção que precisa de revisão individual.",
+      bot_confirm_approve_all:"Aprovar estas {n} folhas de horas, sem exceções?", btn_approve_all:"Aprovar todas",
+      bot_approved_all_msg:"{n} folhas de horas aprovadas. As exceções ficam para revisão individual.",
+      bot_already_approved:"A folha de horas de {name} já está aprovada.",
+      bot_has_exception:"A folha de horas de {name} tem uma exceção ({note}) e precisa de revisão individual no ecrã de Aprovação, essa não pode ser aprovada em bloco.",
+      bot_confirm_approve_one:"Aprovar a folha de horas de {name}?", label_in_project:"No projeto", btn_approve:"Aprovar",
+      bot_approved_one_msg:"Folha de horas de {name} aprovada.",
+      bot_parse_failed:"Não consegui perceber o que registar. Escreve a duração e o projeto, por exemplo <span class=\"num\">2h BNK payroll testing yesterday</span>. Também posso mostrar o estado da semana ou as tuas ausências.",
+      bot_parse_failed_generic:"Não consegui confirmar todos os detalhes desse registo. Podes escrever de outra forma?",
+      bot_which_project:"A que projeto se destinam essas horas?",
+      bot_team_not_found:"não encontrei \"{name}\" na equipa de {code} ({leader}). Se está noutro projeto ou com outro líder, muda o seletor \"Acting as\" ou \"Project\" no topo do ecrã Team primeiro",
+      bot_team_who_unclear:"não percebi de quem se trata", bot_team_day_unclear:"não percebi o dia",
+      bot_team_amount_unclear:"não percebi {amount}", label_the_hours:"as horas", label_the_quantity:"a quantidade",
+      bot_also_unrecognized_wage_type:"Também não reconheci o tipo de rúbrica.",
+      chip_hours_i_have:"Quantas horas tenho?", chip_my_absences:"As minhas ausências", chip_bnk_example:"2h BNK teste de payroll ontem",
+      chip_submit_week:"Submeter a semana", chip_submit_month:"Submeter o mês", chip_copy_last_week:"Copiar a semana anterior",
+      chip_apply_high_conf:"Aplicar as de maior confiança", chip_help:"Ajuda",
+      dlg_add_allowance_title:"Adicionar abono", chip_wage_type:"Tipo de rúbrica", label_allowance:"Abono", label_day:"Dia",
+      btn_cancel:"Cancelar", btn_record_allowance:"Registar abono",
+      dlg_quick_add_title:"Adicionar rápido", label_write_natural:"Escreve em linguagem natural",
+      placeholder_quick_nl:"3h BNK análise de requisitos ontem", chip_waiting_text:"à espera de texto",
+      text_quick_hint:"Cada campo resolvido pode ser corrigido. Se o texto não for reconhecido, vai para a descrição e nada é inventado.",
+      btn_save_entry:"Gravar lançamento",
+      dlg_entry_detail_title:"Detalhe do lançamento", label_project_wbs:"Projeto e WBS",
+      label_start:"Início", label_end:"Fim", label_activity_type:"Tipo de atividade", label_description:"Descrição",
+      placeholder_description:"Obrigatório para lançamentos de projeto. Os primeiros 40 caracteres vão para o LTXA1",
+      placeholder_description_optional:"Opcional para lançamentos internos. Se for preenchido, os primeiros 40 caracteres vão para o LTXA1",
+      label_project_effort:"Esforço do projeto, real vs. planeado",
+      label_origin:"Origem", val_manual:"Manual", label_created_by:"Criado por", label_last_changed:"Última alteração",
+      btn_back:"Voltar", btn_submit:"Submeter",
+      dlg_my_data_title:"Os meus dados", text_data_intro:"Para propor lançamentos, a app só usa metadados, ao nível do projeto:",
+      row_calendar_events:"Eventos do calendário corporativo", row_tickets_handled:"Tickets tratados",
+      row_repos_activity:"Repositórios com atividade", row_content_emails:"Conteúdo de emails, ficheiros ou capturas de ecrã",
+      row_raw_timeline:"Retenção da linha do tempo em bruto",
+      chip_metadata_only:"só metadados", chip_project_level:"nível de projeto", chip_never_collected:"nunca recolhido",
+      val_14_days:"14 dias", chip_or_until_confirmed:"ou até confirmar",
+      text_data_footer:"Esta linha do tempo só é visível para ti. A organização só vê os lançamentos que submetes. Base legal e avaliação de impacto a validar com o DPO antes do piloto.",
+      btn_delete_timeline:"Eliminar linha do tempo",
+      dlg_shortcuts_title:"Atalhos de teclado",
+      row_open_close_assistant:"Abrir e fechar o assistente", row_new_quick_add:"Novo adicionar rápido",
+      row_copy_previous_week:"Copiar semana anterior", row_prev_next_week:"Semana anterior e seguinte",
+      row_confirm_cell:"Confirmar célula e descer", row_show_list:"Mostrar esta lista"
+    },
+    fr: {
+      brand_title:"Saisie des temps", brand_subtitle:"Prototype Fiori",
+      capture_on:"Suggestions activées, historique privé", capture_off:"Capture en pause",
+      aria_it0001:"Société de l'employé, à partir de l'IT0001",
+      aria_project_billing:"Projet à facturer et à affecter aux saisies groupées", aria_leader_scope:"Chef d'équipe et périmètre",
+      aria_mass_entry_section:"Section de saisie groupée", label_approval_week37:"Approbation des temps, semaine 37",
+      label_week_n:"Semaine {n}, {range} {y}", label_range_same_month:"{d1} au {d2} {month}", label_range_diff_month:"{d1} {m1} au {d2} {m2}",
+      status_approved:"Approuvée", status_pending:"Demande en attente",
+      dlg_new_entry_title:"Nouvelle saisie", origin_suggested:"Suggéré", origin_copied:"Copié",
+      dlg_submit_month_title:"Soumettre {month} {y}", dlg_submit_week_title:"Soumettre la semaine {n}",
+      ui_undo:"Annuler", ui_resolve:"Résoudre", ui_reopen:"Rouvrir",
+      toast_bad_duration:"Impossible de lire « {v} ». Utilisez 1.5, 1:30 ou 90m.",
+      toast_only_available:" Seulement {left} h disponibles.", toast_no_hours_available:" Aucune heure disponible ce jour-là.",
+      toast_bad_clock:"Impossible de lire « {v} ». Utilisez 08:00 ou 8.",
+      toast_row_removed:"Ligne supprimée.",
+      toast_month_submitted_no_rows:"Ce mois est déjà soumis, aucune ligne supplémentaire ne peut être ajoutée.",
+      toast_all_projects_used_month:"Tous les projets disponibles pour cette société ont déjà une ligne ce mois-ci.",
+      toast_no_earlier_months:"Pas de mois d'exemple antérieurs.", toast_no_later_months:"Pas de mois d'exemple suivants.",
+      toast_sugg_blocked_absence:"{day} a une absence approuvée, la suggestion ne peut pas être appliquée.",
+      toast_suggestion_accepted:"Suggestion acceptée le {day}.",
+      toast_suggestion_dismissed:"Suggestion rejetée. Le modèle ne sera plus proposé.",
+      toast_absence_approved_conflict:"Absence approuvée le {day}. Les {h} h enregistrées ce jour-là sont maintenant en conflit.",
+      toast_absence_approved_no_conflict:"Absence approuvée le {day}. Le jour n'est plus disponible pour la saisie.",
+      toast_hours_moved:"{h} h déplacées de {from} vers {to}.",
+      toast_hours_removed_no_capacity:"{h} h supprimées de {day}, aucun jour n'avait de capacité libre.",
+      toast_allowance_removed:"{name} supprimé.",
+      toast_week_submitted_no_allow_change:"La semaine est soumise, les indemnités ne peuvent plus être modifiées.",
+      toast_week_closed_period:"Cette semaine tombe dans une période clôturée.",
+      toast_qty_must_be_positive:"La quantité doit être un nombre supérieur à zéro.",
+      toast_allowance_recorded:"{name} enregistré le {day}.",
+      toast_bad_number:"Impossible de lire « {v} ».",
+      toast_capacity_on_day:"La capacité de {name} est de {cap} h le {day}.",
+      toast_select_person_first:"Sélectionnez d'abord au moins une personne.",
+      toast_give_duration_or_clock:"Indiquez une durée, ou une heure de début et de fin.",
+      toast_pick_a_day:"Choisissez au moins un jour.",
+      toast_cells_filled:"{n} cellules remplies pour {people} personnes. Rien n'est encore enregistré, vérifiez d'abord la grille.",
+      cells_skipped_field_one:" {n} cellule ignorée, a besoin de l'autre champ pour ce profil.",
+      cells_skipped_field_other:" {n} cellules ignorées, ont besoin de l'autre champ pour ce profil.",
+      cells_skipped_capacity_one:" {n} cellule ignorée, dépasse la capacité journalière de cette personne.",
+      cells_skipped_capacity_other:" {n} cellules ignorées, dépassent la capacité journalière de cette personne.",
+      toast_team_entries_partial:"{saved} saisies enregistrées pour {who}. {left} restent à l'écran avec le motif. Cliquez sur Enregistrer pour terminer.",
+      toast_team_entries_all:"{saved} saisies enregistrées pour {who}, pour leur compte. Cliquez sur Enregistrer pour terminer.",
+      toast_team_entries_none:"Rien n'a été enregistré. Chaque ligne a un motif à côté.",
+      toast_give_qty_positive:"Indiquez une quantité supérieure à zéro.",
+      toast_note_required_for:"{note} est obligatoire pour {name}.",
+      allow_lines_staged_one:"{n} ligne d'indemnité en attente pour {people} personnes. Rien n'est encore enregistré.",
+      allow_lines_staged_other:"{n} lignes d'indemnité en attente pour {people} personnes. Rien n'est encore enregistré.",
+      toast_allow_skipped_company:" {n} ignorés, l'indemnité de poste ne s'applique pas à leur société.",
+      toast_allow_skipped_project:" {n} ignorés, non alloués à {code}.",
+      toast_nothing_staged:"Rien en attente.",
+      allow_lines_recorded_one:"{n} ligne d'indemnité enregistrée, pour leur compte. Cliquez sur Enregistrer pour terminer.",
+      allow_lines_recorded_other:"{n} lignes d'indemnité enregistrées, pour leur compte. Cliquez sur Enregistrer pour terminer.",
+      toast_nothing_to_save:"Rien à enregistrer.", toast_changes_saved:"Modifications enregistrées.",
+      toast_amount_must_be_positive:"Le montant doit être un nombre supérieur à zéro.",
+      toast_bonus_reason_required:"La prime a besoin d'un motif. C'est la seule trace de la raison pour laquelle le projet a porté ce coût.",
+      toast_none_allocated:"Aucune des personnes sélectionnées n'est allouée à {code}.",
+      toast_bonus_recorded:"Prime de {amount} EUR enregistrée pour {names}, approuvée dans le même acte.",
+      toast_bonus_none_recorded:"Rien n'a réellement été enregistré.",
+      toast_bonus_skipped_ineligible:" {names} ignorés, non alloués à {code}.",
+      toast_bonus_skipped_closed:" {names} ignorés, tous les jours de cette semaine tombent dans une période clôturée.",
+      toast_week_submitted_no_rows:"Cette semaine est déjà soumise, aucune ligne supplémentaire ne peut être ajoutée.",
+      toast_all_projects_used_week:"Tous les projets disponibles pour cette société ont déjà une ligne cette semaine.",
+      toast_copy_week_done:"Structure de la semaine précédente copiée, sans les durées. {n} nouvelles lignes.",
+      toast_copy_week_none:"Toutes les lignes de la semaine précédente sont déjà présentes.",
+      toast_no_earlier_weeks:"Pas de semaines d'exemple antérieures.", toast_no_later_weeks:"Pas de semaines d'exemple suivantes.",
+      toast_template_applied:"Modèle d'allocation appliqué aux jours ouvrés.",
+      toast_it0001_changed:"L'IT0001 indique désormais {bukrs}. Le ZTIME_COMPANY_CFG le mappe vers {code} : {fields}.",
+      toast_week_submitted_locked:"La semaine est soumise, elle ne peut plus être modifiée.",
+      toast_day_absence_blocked:"{day} a une absence approuvée, n'accepte pas de nouvelles saisies.",
+      toast_day_closed_period:"{day} tombe dans une période clôturée, ne peut pas recevoir de nouvelles heures.",
+      toast_hours_recorded:"{h} h enregistrées sur {code}, {day}.",
+      toast_entry_added:"Saisie ajoutée.",
+      toast_row_exists_week:"{code} a déjà une ligne cette semaine. Supprimez-la ou fusionnez-la d'abord.",
+      toast_entry_updated:"Saisie mise à jour.",
+      toast_row_exists_month:"{code} a déjà une ligne ce mois-ci. Supprimez-la ou fusionnez-la d'abord.",
+      weeks_submitted_approval_one:"{n} semaine soumise pour approbation. Cliquez sur Enregistrer pour terminer.",
+      weeks_submitted_approval_other:"{n} semaines soumises pour approbation. Cliquez sur Enregistrer pour terminer.",
+      toast_week_submitted_approval:"Semaine {n} soumise pour approbation. Cliquez sur Enregistrer pour terminer.",
+      toast_high_conf_applied:"{n} suggestions à forte confiance appliquées. Celles à confiance moyenne et faible restent à revoir.",
+      toast_timeline_deleted:"Historique brut supprimé. Les suggestions en attente ont disparu avec lui.",
+      toast_timesheets_approved:"{n} relevés approuvés en un seul appel. Les exceptions restent à revoir.",
+      toast_voice_error:"Erreur de saisie vocale : {err}",
+      toast_staged_entries_cleared:"Saisies en attente effacées. Rien n'avait été enregistré.",
+      toast_staged_allow_cleared:"Indemnités en attente effacées. Rien n'avait été enregistré.",
+      val_day_exceeds_24h:"Le total pour {day} dépasse 24 heures.",
+      val_desc_required:"Les saisies de projet ont besoin d'une description : {code}.",
+      val_absence_move_hours:"{day} a une {type} approuvée. Les {h} h enregistrées doivent être déplacées hors de ce jour.",
+      val_partial_absence_capacity:"{day} a une absence partielle approuvée. La capacité du jour est de {cap} h et {tot} h sont enregistrées.",
+      val_day_capacity:"La capacité de {day} est de {cap} h ; {tot} h sont enregistrées.",
+      val_pending_leave_conflict:"{day} a une demande d'absence en attente et des heures enregistrées. Si la demande est approuvée, ces heures seront en conflit.",
+      val_day_empty:"{day} est vide.",
+      val_week_below_expected:"La semaine a {tot} h enregistrées ; le total attendu avec les absences déduites est de {expect} h.",
+      val_closed_period:"{day} tombe dans la période {ym}, clôturée pour {bukrs}. La réouverture est une action RH.",
+      val_overlapping_windows:"{day} a des plages horaires qui se chevauchent : {t1} à {t2} et {t3} à {t4}.",
+      val_window_needs_both:"{day}, {code} : la plage a besoin d'un début et d'une fin.",
+      val_allow_note_needed:"{name} le {day} a besoin de {noteLabel}.",
+      val_allow_closed_period:"{name} le {day} tombe dans une période clôturée.",
+      val_allow_no_amount:"{name} le {day} n'a pas de montant.",
+      val_allow_no_qty:"{name} le {day} n'a pas de quantité.",
+      n_suggestions_to_review2_one:"{n} suggestion encore à revoir dans le panneau latéral.",
+      n_suggestions_to_review2_other:"{n} suggestions encore à revoir dans le panneau latéral.",
+      suggestions_discarded_one:"{n} suggestion écartée car elle tombe sur un jour avec une absence approuvée.",
+      suggestions_discarded_other:"{n} suggestions écartées car elles tombent sur des jours avec une absence approuvée.",
+      th_project_wbs_activity:"Projet, WBS et activité", row_total_per_day:"Total par jour", btn_remove:"Supprimer",
+      tip_approved_partial_absence:"Absence partielle approuvée, capacité de {h} h ce jour-là",
+      btn_copy_last_week:"Copier la semaine dernière", btn_add_first_project:"Ajouter le premier projet",
+      btn_resume_suggestions:"Reprendre les suggestions", btn_simulate_approval:"Simuler l'approbation",
+      tip_bonus_remove_restricted:"La prime est supprimée par le responsable du projet, sur l'écran équipe.",
+      text_no_records_to_generate:"Aucune heure ni indemnité cette semaine, donc aucun enregistrement à générer.",
+      voice_not_supported:"Saisie vocale non prise en charge dans ce navigateur",
+      tip_absence_not_available:"{type} approuvée, jour indisponible pour la saisie",
+      text_desc_required:"Description obligatoire", text_no_description:"Aucune description",
+      aria_remove_row:"Supprimer la ligne {name}",
+      tip_period_closed:"La période {ym} est clôturée pour {bukrs}. La réouverture est une action RH.",
+      placeholder_desc_required_once:"Description (obligatoire dès que des heures sont saisies)", placeholder_description_short:"Description",
+      text_absence_generic:"absence",
+      tip_approved_type:"{type} approuvée", aria_select_name:"Sélectionner {name}",
+      hdr_no_warnings_group:"Sans avertissement, approbation groupée possible", hdr_exceptions_group:"Exceptions, révision individuelle nécessaire",
+      aria_select_timesheet_for:"Sélectionner le relevé de {name}",
+      tip_clock_use_fields:"Z_BSRV enregistre le début et la fin. Utilisez les champs Début/Fin ci-dessus, pour les personnes concernées.",
+      tip_closed_period_short:"Période clôturée",
+      aria_start_time_for:"Heure de début, {name}, {day}", aria_end_time_for:"Heure de fin, {name}, {day}",
+      sev_error:"ERREUR", sev_warning:"AVERTISSEMENT", sev_info:"INFO",
+      text_no_allowances_week:"Aucune indemnité enregistrée cette semaine. Les indemnités journalières, kilométriques et de poste sont enregistrées ici, contre un projet et une date.",
+      text_wage_type_label:"rubrique {code}",
+      text_recorded_by_behalf:"Enregistré par {name}, pour le compte de l'employé",
+      hint_allow_wage_type:"Rubrique {code}, quantité en ANZHL, unité {unit}. Aucune valeur n'est calculée ici, la paie la valorise.",
+      text_nothing_staged_yet:"Rien en attente pour l'instant.",
+      text_nothing_recorded_behalf_week:"Rien enregistré pour le compte de l'équipe pour l'instant, cette semaine.",
+      text_no_bonus_recorded:"Aucune prime enregistrée sur ce projet pour l'instant.",
+      label_month_total:"Total du mois", label_week_total:"Total de la semaine",
+      n_warnings_no_block_one:"{n} avertissement, ne bloque pas la soumission", n_warnings_no_block_other:"{n} avertissements, ne bloquent pas la soumission",
+      label_deviation_justification:"Justification de l'écart par rapport au total attendu",
+      placeholder_justification_month:"Une ligne suffit. Reste dans l'historique du mois.",
+      text_h_in_project:"{h} h sur projet", chip_warning_lower:"avertissement",
+      msg_day_approved_type:"{day} a une {type} approuvée.", msg_day_capacity_simple:"La capacité de {day} est de {cap} h.",
+      badge_half_day:"demi-journée",
+      text_no_hours_week_yet:"Aucune heure enregistrée cette semaine pour l'instant.", text_no_hours_month_yet:"Aucune heure enregistrée ce mois-ci pour l'instant.",
+      text_shortest_path:"Commencez par le chemin le plus court.",
+      conf_hi:"confiance élevée", conf_mid:"confiance moyenne", conf_low:"confiance faible",
+      tip_save_to_finish:"C'est déjà en vigueur ici ; Save ne fait que le refléter dans la base de données.",
+      placeholder_justification_week:"Une ligne suffit. Reste dans l'historique de la semaine.",
+      chip_approved:"Approuvée",
+      note_pending_leave_conflict:"Demande d'absence en attente chevauche des heures enregistrées", note_two_empty_days:"Deux jours ouvrés vides",
+      val_week_label_prefix:"Semaine {n} : {txt}",
+      link_resolve_move_hours:"résoudre, déplacer les heures", link_go_to_day:"aller au jour",
+      btn_shortcuts:"Raccourcis", aria_shortcuts:"Raccourcis clavier",
+      btn_settings:"Paramètres", aria_settings:"Paramètres de langue",
+      nav_my_timesheet:"Mon relevé", nav_team:"Équipe (saisie groupée)",
+      nav_approval:"Approbation (manager)", nav_cats:"Mappage CATS",
+      aria_prev_week:"Semaine précédente", aria_next_week:"Semaine suivante",
+      state_draft:"Brouillon", state_in_approval:"En approbation, lecture seule",
+      btn_quick_add:"Ajout rapide", btn_submit_week:"Soumettre la semaine", btn_save:"Enregistrer",
+      kpi_recorded:"Enregistré", kpi_in_project:"Sur projet", kpi_validation:"Validation",
+      val_no_errors:"Aucune erreur",
+      n_errors_one:"{n} erreur", n_errors_other:"{n} erreurs",
+      n_messages_one:"{n} message", n_messages_other:"{n} messages",
+      n_weeks_one:"{n} semaine", n_weeks_other:"{n} semaines",
+      n_empty_days_one:"{n} jour ouvré vide", n_empty_days_other:"{n} jours ouvrés vides",
+      n_allowances_one:"{n} indemnité", n_allowances_other:"{n} indemnités",
+      n_records_generated_one:"{n} enregistrement généré", n_records_generated_other:"{n} enregistrements générés",
+      n_people_one:"{n} personne", n_people_other:"{n} personnes",
+      n_entries_one:"{n} saisie", n_entries_other:"{n} saisies",
+      n_suggestions_review_one:"{n} suggestion à revoir", n_suggestions_review_other:"{n} suggestions à revoir",
+      btn_submit_month:"Soumettre le mois", btn_month_submitted:"Mois soumis",
+      btn_week_submitted:"Semaine soumise", chip_in_approval:"En approbation",
+      kextra_absences:"{h} h d'absences déduites", kextra_month_prefix:"{weeks} ce mois-ci",
+      n_selected_one:"{n} sélectionné", n_selected_other:"{n} sélectionnés",
+      lines_staged_suffix_one:"ligne en attente", lines_staged_suffix_other:"lignes en attente", h_staged_suffix:"h en attente",
+      hdr_week_entries:"Saisies de la semaine", aria_view:"Vue", btn_grid:"Grille", btn_calendar:"Calendrier",
+      hdr_how_it_works:"Comment ça marche ?",
+      how_step1:"Créer ou sélectionner le projet", how_step2:"Saisir les heures",
+      how_step3:"Valider", how_step4:"Enregistrer ou soumettre",
+      aria_collapse_how:"Réduire Comment ça marche", aria_expand_how:"Développer Comment ça marche",
+      legend_over:"Total par jour : au-delà de la capacité", legend_empty:"Jour ouvré vide",
+      legend_unavailable:"Indisponible (absence ou jour non ouvré)", legend_submitted:"Semaine déjà soumise",
+      btn_add_row:"Ajouter une ligne", btn_copy_week:"Copier la semaine précédente", btn_apply_template:"Appliquer un modèle",
+      hint_grid_entry:"Accepte 1.5 · 1:30 · 90m. Entrée descend, Tab avance.",
+      hint_calendar:"Cliquez sur un créneau libre pour saisir du temps ce jour-là. Absences et jours fériés non modifiables.",
+      hdr_validation_messages:"Messages de validation", hdr_allowances:"Indemnités",
+      btn_add_allowance:"Ajouter une indemnité",
+      privacy_allowances:"Les indemnités journalières, kilométriques et de poste sont enregistrées contre un projet et une date, en quantité et en unité. Aucune valeur n'est calculée ici. La prime de projet est l'exception : elle porte un montant et seul le responsable du projet l'enregistre.",
+      aria_collapse_suggestions:"Réduire les suggestions", aria_expand_suggestions:"Développer les suggestions",
+      aria_collapse_allowances:"Réduire les indemnités", aria_expand_allowances:"Développer les indemnités",
+      hdr_suggestions:"Suggestions cette semaine", btn_accept_high_confidence:"Accepter celles à forte confiance",
+      privacy_suggestions_intro:"Rien n'entre dans le relevé sans confirmation.",
+      btn_data_collected:"Ce qui est collecté et où c'est stocké",
+      hdr_specmap:"Correspondance entre ce prototype et la spécification",
+      text_specmap_intro:"Chaque écran ci-dessous correspond à une section du document de spécification, pour que les échanges avec l'équipe de développement se fassent sur le même vocabulaire.",
+      spec_e1:"Grille hebdomadaire avec édition en ligne, totaux par jour et par ligne, copie de semaine",
+      spec_e2:"Vue calendrier avec blocs de projet et événements externes à convertir",
+      spec_e3:"Ajout rapide en langage naturel avec chips corrigibles",
+      spec_e4:"Suggestions avec motif, niveau de confiance et action explicite",
+      spec_e5:"Détail de la saisie avec contexte budgétaire et historique",
+      spec_e6:"Validation à trois niveaux de gravité et résumé avant soumission",
+      spec_e7:"Approbation groupée avec exceptions isolées",
+      spec_e10:"Absences issues du Leave Request, blocage de jour et capacité partielle",
+      spec_e11:"Assistant conversationnel avec confirmation avant enregistrement",
+      spec_e12:"Indemnités contre un projet, une rubrique et une quantité, prime avec un montant",
+      spec_e13:"Début et fin selon le profil de saisie, dérivé de l'IT0001",
+      spec_e14:"Saisie groupée par le chef d'équipe, avec enregistrement partiel et trace pour le compte de",
+      aria_expand_already:"Développer déjà enregistré", aria_collapse_already:"Réduire déjà enregistré",
+      hdr_already_recorded:"Déjà enregistré cette semaine", hdr_already_allow:"Indemnités enregistrées cette semaine",
+      chip_readonly:"Lecture seule",
+      hint_already:"Depuis le relevé de chaque personne ou une saisie groupée antérieure, plus ce qui est en attente ci-dessous mais pas encore enregistré. Ambré à 8h, rouge au-delà.",
+      hint_already_allow:"Indemnités déjà enregistrées pour cette équipe cette semaine, depuis le relevé de chaque personne ou une saisie groupée antérieure.",
+      tab_hours:"Heures", tab_allowances:"Indemnités", tab_bonus:"Prime",
+      hdr_team:"Équipe", hdr_fill_several:"Remplir plusieurs personnes à la fois",
+      label_duration:"Durée", label_start_time:"Heure de début", label_end_time:"Heure de fin", label_days:"Jours",
+      btn_apply_selected:"Appliquer à la sélection",
+      btn_save_staged_entries:"Enregistrer les saisies en attente", btn_clear:"Effacer",
+      hint_mass_save:"L'enregistrement est partiel. Les lignes en échec restent à l'écran avec le motif. Durée remplit les personnes sur un profil de durée, Début/Fin remplit les personnes sur Z_BSRV, en un seul clic.",
+      hdr_allowances_selected:"Indemnités pour les personnes sélectionnées",
+      label_wage_type:"Rubrique", label_quantity:"Quantité", label_note:"Note",
+      placeholder_note_required:"Obligatoire pour cette indemnité",
+      btn_stage_selected:"Mettre en attente pour la sélection", btn_save_staged_allowances:"Enregistrer les indemnités en attente",
+      hint_mass_allow:"Facturé au Projet choisi en haut de l'écran, le même que pour Heures. La prime est enregistrée séparément, dans l'onglet Prime.",
+      hdr_project_bonus:"Prime de projet", label_amount_eur:"Montant, EUR", label_reason:"Motif",
+      placeholder_bonus_reason:"Week-end de mise en service, clôture de paie",
+      btn_record_approve_selected:"Enregistrer et approuver pour la sélection",
+      privacy_bonus:"La prime est la seule indemnité que l'employé n'enregistre pas. Le responsable du projet définit le montant et approuve dans le même acte, car c'est le projet qui porte le coût. Le montant vit dans un champ client, la CATSDB étant une structure de quantités.",
+      hdr_recorded_on_behalf:"Enregistré pour le compte de",
+      privacy_recorded_on_behalf:"Chaque ligne conserve CREATED_BY et ON_BEHALF_OF. Il n'y a pas d'étape d'auto-confirmation : l'employé voit la saisie marquée comme enregistrée par le chef d'équipe, ce qui informe sans bloquer. Côté CATS, l'utilisateur qui soumet reste dans ERNAM.",
+      kpi_selected:"Sélectionnés", kpi_staged_not_saved:"En attente, non enregistré", kpi_recorded_on_behalf:"Enregistré pour le compte de",
+      label_project:"Projet", label_acting_as:"Agit en tant que",
+      chip_up_to_date:"À jour", chip_save_to_finish:"Enregistrer pour terminer",
+      btn_select_no_warnings:"Sélectionner les 4 sans avertissement", chip_project_team:"Équipe du projet", btn_approve_selected:"Approuver la sélection",
+      text_approval_sub:"La file d'une autre personne, pas votre propre semaine. Couvre les personnes sur les projets de conseil de Sofia (Banking, Retail, Airports) — rien de ce que vous soumettez dans Mon relevé n'apparaît ici.",
+      text_approval_sub_pt02:"La file d'une autre personne, pas votre propre semaine. Couvre les personnes sur les projets facilities de Patrícia (Hospital campus, Airport terminal) — rien de ce que vous soumettez dans Mon relevé n'apparaît ici.",
+      kpi_pending_approval:"En attente d'approbation", kpi_hours_submitted:"Heures soumises",
+      kpi_with_warnings:"Avec avertissements", kpi_deviation_from_plan:"Écart par rapport au plan",
+      hdr_team_allocated:"Équipe allouée à mes projets", chip_integrates:"S'intègre avec My Inbox et SAP Task Center",
+      th_employee:"Employé", th_total:"Total", th_deviation:"Écart", th_status:"Statut",
+      aria_select_all:"Tout sélectionner",
+      hint_bulk_approval:"L'approbation groupée n'est disponible que pour les lignes sans avertissement. Le rejet exige un motif, selon le standard SAP.",
+      label_cats_header:"De l'interface vers CATS", chip_annex_a:"Annexe A de la spécification",
+      kpi_recording_target:"Cible d'enregistrement", kpi_assistance_layer:"Couche d'assistance",
+      kpi_direct_table_write:"Écriture directe en table", val_never:"Jamais", kpi_customer_fields:"Champs client",
+      hdr_state_chain:"Chaîne d'états et transfert",
+      step_draft:"Brouillon", step_draft_sub:"BTP uniquement",
+      step_saved:"Enregistré", step_saved_sub:"CATSDB, en cours",
+      step_in_approval:"En approbation", step_in_approval_sub:"libéré, STATUS",
+      step_approved:"Approuvé", step_approved_sub:"APNAM, APDAT",
+      step_posted:"Comptabilisé", step_posted_sub:"CATA, CAT5, CAT7, CAT9",
+      rule_1:"À partir de <strong>En approbation</strong>, modifier n'est plus un simple changement. La correction crée un nouvel enregistrement qui pointe vers l'original via <span class=\"num\">REFCOUNTER</span>, et repasse par l'approbation.",
+      rule_2:"Le verrouillage des cellules reflète ce qui a déjà été transféré, pas seulement ce qui a été approuvé. Le transfert s'exécute comme un job, donc l'interface affiche la date du prochain cycle au lieu de prétendre que c'est instantané.",
+      hdr_field_mapping:"Mappage champ par champ", chip_cats_or_btp:"CATS, BTP ou champ client",
+      th_interface_element:"Élément d'interface", th_sap_concept:"Concept SAP", th_field:"Champ", th_where_lives:"Où il vit",
+      hdr_cats_records:"Enregistrements CATS générés à partir de la semaine remplie", aria_format:"Format",
+      btn_table:"Tableau", btn_api_payload:"Payload API",
+      hint_cats_table:"Généré en direct à partir de la grille de l'écran Mon relevé. LTXA1 est tronqué à 40 caractères, la limite réelle du champ.",
+      assistant_fab:"Assistant", assistant_title:"Assistant", chip_joule_pattern:"Modèle Joule",
+      btn_close:"Fermer", aria_close_assistant:"Fermer l'assistant",
+      placeholder_chat:"2h BNK test de paie hier", btn_send:"Envoyer",
+      jfoot_text:"N'enregistre jamais sans confirmation. Les saisies créées ici sont marquées avec l'origine <span class=\"num\">Joule</span> et passent par les mêmes validations.",
+      aria_dictate:"Dicter à la voix",
+      bot_greeting:"Bonjour {name} ! Je peux saisir des heures, pour vous ou pour l'équipe, vérifier la semaine, gérer les absences, approuver des relevés, ou simplement vous emmener au bon écran. De quoi avez-vous besoin ?",
+      bot_greeting_1:"Bonjour ! De quoi avez-vous besoin : saisir des heures, vérifier la semaine, ou autre chose ?",
+      bot_greeting_2:"Bonjour. Dites-moi ce qu'il vous faut et je m'en occupe.",
+      bot_greeting_3:"Bonjour ! Des heures à saisir, ou quelque chose à vérifier ?",
+      chip_confirmed:"confirmé", chip_cancelled:"annulé",
+      bot_cancelled_no_save:"Pas de problème, je n'ai rien enregistré.",
+      bot_week_summary:"Vous avez {tot} h enregistrées sur {exp} h attendues, absences déjà déduites. ",
+      bot_week_errors_block_one:"{n} erreur bloque la soumission.", bot_week_errors_block_other:"{n} erreurs bloquent la soumission.",
+      bot_week_no_errors_submit:"Aucune erreur, vous pouvez soumettre.",
+      bot_absences_intro:"Voici les absences de cette semaine, issues de la demande de congé. Les jours avec une absence de journée entière approuvée n'acceptent pas de saisie d'heures.",
+      bot_help_text:"Voici ce que je peux faire : saisir vos heures (<span class=\"num\">2h BNK payroll testing yesterday</span>), saisir pour quelqu'un de l'équipe (<span class=\"num\">4h for João today</span>), vérifier la semaine ou les absences, copier la semaine précédente, appliquer les suggestions à forte confiance, soumettre la semaine, approuver des relevés, ou aller vers Équipe, Approbation ou Mappage CATS. Écrivez simplement en langage naturel.",
+      bot_switched_to:"Passé à {screen}.",
+      bot_suggestions_available:"Vous avez {n} suggestions à revoir dans le panneau latéral. Je peux appliquer celles à forte confiance, si vous le souhaitez.",
+      bot_no_suggestions:"Aucune suggestion à revoir.",
+      bot_no_high_conf:"Je n'ai aucune suggestion à forte confiance en attente.",
+      bot_confirm_apply_suggestions:"Confirmez l'application de ces suggestions ?", btn_apply:"Appliquer",
+      bot_suggestions_applied:"{n} suggestions appliquées. ",
+      bot_copy_week_offer:"Je peux reprendre la structure de la semaine précédente, sans les durées.",
+      label_action:"Action", bot_copy_rows_value:"copier les lignes de la semaine précédente",
+      label_durations:"Durées", bot_stay_zero_value:"restent à zéro", btn_copy:"Copier",
+      bot_copy_week_done:"C'est fait. Les lignes sont créées, les durées restent à remplir.",
+      bot_week_already_submitted:"La semaine est déjà soumise et en approbation.",
+      bot_cant_submit_yet:"Je ne peux pas encore soumettre. {reason}",
+      bot_confirm_submit_week:"Confirmez la soumission de la semaine {num} ?",
+      label_expected:"Attendu", label_status_after_submit:"Statut après soumission",
+      bot_week_submitted_msg:"Semaine soumise. Elle est maintenant en approbation auprès du chef de projet.",
+      bot_week_locked:"La semaine est déjà soumise, je ne peux pas la modifier. Voulez-vous voir autre chose ?",
+      bot_day_absence_no_alt:"{day} a une {type} approuvée et aucun autre jour n'a de capacité libre. Je n'ai rien enregistré.",
+      bot_day_absence_suggest:"{day} a une {type} approuvée, donc n'accepte pas d'heures. Je suggère {alt}.",
+      bot_day_closed:"{day} tombe dans une période clôturée, elle ne peut pas recevoir de nouvelles heures. Je n'ai rien enregistré.",
+      bot_day_abs_cap:"{day} a une {type} approuvée.", bot_day_capacity:"La capacité de {day} est de {cap} h.",
+      bot_hours_left_suffix:" Seulement {left} h disponibles, je n'ai rien enregistré.",
+      bot_no_hours_suffix:" Aucune heure disponible ce jour-là, je n'ai rien enregistré.",
+      bot_confirm_entry:"Confirmez cette saisie ?", label_receiver_object:"Objet récepteur",
+      bot_receiver_pep:"PEP {code}", bot_receiver_cost_center:"Centre de coûts {code}",
+      bot_desc_tbd:"(à compléter)", bot_entry_saved:"{dur} h enregistrées le {day}, {code}. ",
+      bot_every_day_blocked:"Chaque jour de cette période a une absence approuvée, tombe dans une période clôturée, ou n'a pas la place pour cette quantité. Je n'ai rien enregistré.",
+      bot_skip_absence_closed:"{days} (absence approuvée ou période clôturée)", bot_skip_over_capacity:"{days} (au-delà de la capacité)",
+      bot_days_skipped_suffix:" ({parts} ignorés)", label_duration_per_day:"Durée par jour",
+      bot_entry_saved_days_one:"{dur} h enregistrées sur {n} jour ({total} h au total), {code}. ",
+      bot_entry_saved_days_other:"{dur} h enregistrées sur {n} jours ({total} h au total), {code}. ",
+      bot_week_capacity_full:"Tous les jours ouvrés de cette semaine sont déjà à pleine capacité.",
+      bot_month_capacity_full:"Tous les jours ouvrés de ce mois sont déjà à pleine capacité.",
+      bot_filled_saved_one:"{total} h enregistrées sur {n} jour, {code}. ", bot_filled_saved_other:"{total} h enregistrées sur {n} jours, {code}. ",
+      bot_filled_saved_month_one:"{total} h enregistrées sur {n} jour, {code}, ce mois-ci. ",
+      bot_filled_saved_month_other:"{total} h enregistrées sur {n} jours, {code}, ce mois-ci. ",
+      bot_cant_stage:"Impossible de mettre ça en préparation : {list}.", bot_week_already_approved:"{name} (semaine déjà approuvée)",
+      label_people:"Personnes", label_time:"Horaire", label_duration_each:"Durée de chacun", label_skipped:"Ignorés",
+      bot_confirm_register_staging:"Mettre ceci en zone de préparation ?", btn_register:"Enregistrer",
+      bot_staged_saved:"Mis en préparation pour {names}, {days}, {code}. Cliquez sur {save} pour terminer.",
+      bot_staged_nothing:"Rien n'a été réellement enregistré.",
+      bot_staged_not_saved_suffix:" {names} n'a/ont pas pu de cette façon (non alloué à {code}, mauvais profil pour ce champ, absence, ou période clôturée), la raison est sur l'écran Équipe.",
+      bot_note_required:"{noteLabel} est obligatoire pour {name}. Que doit-elle indiquer ?",
+      label_quantity_each:"Quantité de chacun",
+      bot_staged_saved_allow:"Mis en préparation pour {names}, {days}, {name}. Cliquez sur {save} pour terminer.",
+      bot_staged_not_saved_allow_suffix:" {names} n'a/ont pas pu (non alloué à {code}, mauvaise entreprise pour cette indemnité, ou période clôturée).",
+      bot_team_nobody_missing:"Personne dans l'équipe de {code} n'a de jours ouvrés manquants cette semaine.",
+      bot_team_already_full:"{names} est/sont déjà à pleine capacité cette semaine, dans l'équipe de {code}.",
+      bot_team_person_not_found:"Je n'ai trouvé personne nommé \"{name}\" dans l'équipe de {code}.",
+      bot_confirm_fill_team:"Compléter ces jours manquants jusqu'à la capacité de chacun ?",
+      btn_fill_and_register:"Compléter et enregistrer",
+      bot_team_filled_saved:"Complété et mis en préparation pour {names}. Cliquez sur {save} pour terminer.",
+      bot_team_filled_nothing:"Rien n'a été enregistré.",
+      bot_team_filled_not_saved_suffix:" {names} n'a/ont pas pu, la raison est sur la grille Équipe.",
+      bot_approval_ask_who:"Dites-moi qui approuver, un nom, ou «approuver tout le monde» pour tous les relevés sans exception.",
+      bot_approval_nothing:"Rien à approuver ici, soit tout est déjà approuvé, soit ce qui reste a une exception qui nécessite une revue individuelle.",
+      bot_confirm_approve_all:"Approuver ces {n} relevés, sans exception ?", btn_approve_all:"Tout approuver",
+      bot_approved_all_msg:"{n} relevés approuvés. Les exceptions restent à revoir individuellement.",
+      bot_already_approved:"Le relevé de {name} est déjà approuvé.",
+      bot_has_exception:"Le relevé de {name} a une exception ({note}) et nécessite une revue individuelle sur l'écran Approbation, celui-là ne peut pas être approuvé en bloc.",
+      bot_confirm_approve_one:"Approuver le relevé de {name} ?", label_in_project:"Sur le projet", btn_approve:"Approuver",
+      bot_approved_one_msg:"Relevé de {name} approuvé.",
+      bot_parse_failed:"Je n'ai pas compris ce qu'il fallait enregistrer. Écrivez la durée et le projet, par exemple <span class=\"num\">2h BNK payroll testing yesterday</span>. Je peux aussi afficher le statut de la semaine ou vos absences.",
+      bot_parse_failed_generic:"Je n'ai pas saisi tous les détails de cette saisie. Pouvez-vous l'écrire autrement ?",
+      bot_which_project:"Pour quel projet sont ces heures ?",
+      bot_team_not_found:"je n'ai pas trouvé \"{name}\" dans l'équipe de {code} ({leader}). S'il/elle est sur un autre projet ou avec un autre responsable, changez d'abord le sélecteur \"Acting as\" ou \"Project\" en haut de l'écran Équipe",
+      bot_team_who_unclear:"je n'ai pas compris de qui il s'agit", bot_team_day_unclear:"je n'ai pas compris le jour",
+      bot_team_amount_unclear:"je n'ai pas compris {amount}", label_the_hours:"les heures", label_the_quantity:"la quantité",
+      bot_also_unrecognized_wage_type:"Je n'ai pas non plus reconnu la rubrique.",
+      chip_hours_i_have:"Combien d'heures ai-je ?", chip_my_absences:"Mes absences", chip_bnk_example:"2h BNK test de paie hier",
+      chip_submit_week:"Soumettre la semaine", chip_submit_month:"Soumettre le mois", chip_copy_last_week:"Copier la semaine précédente",
+      chip_apply_high_conf:"Appliquer celles à forte confiance", chip_help:"Aide",
+      dlg_add_allowance_title:"Ajouter une indemnité", chip_wage_type:"Rubrique", label_allowance:"Indemnité", label_day:"Jour",
+      btn_cancel:"Annuler", btn_record_allowance:"Enregistrer l'indemnité",
+      dlg_quick_add_title:"Ajout rapide", label_write_natural:"Écrivez en langage naturel",
+      placeholder_quick_nl:"3h BNK analyse des besoins hier", chip_waiting_text:"en attente de texte",
+      text_quick_hint:"Chaque champ résolu peut être corrigé. Si le texte n'est pas reconnu, il va dans la description et rien n'est inventé.",
+      btn_save_entry:"Enregistrer la saisie",
+      dlg_entry_detail_title:"Détail de la saisie", label_project_wbs:"Projet et WBS",
+      label_start:"Début", label_end:"Fin", label_activity_type:"Type d'activité", label_description:"Description",
+      placeholder_description:"Obligatoire pour les saisies de projet. Les 40 premiers caractères vont dans LTXA1",
+      placeholder_description_optional:"Facultatif pour les saisies internes. Si elle est remplie, les 40 premiers caractères vont dans LTXA1",
+      label_project_effort:"Effort projet, réel vs. planifié",
+      label_origin:"Origine", val_manual:"Manuel", label_created_by:"Créé par", label_last_changed:"Dernière modification",
+      btn_back:"Retour", btn_submit:"Soumettre",
+      dlg_my_data_title:"Mes données", text_data_intro:"Pour proposer des saisies, l'application n'utilise que des métadonnées, au niveau du projet :",
+      row_calendar_events:"Événements du calendrier d'entreprise", row_tickets_handled:"Tickets traités",
+      row_repos_activity:"Dépôts avec activité", row_content_emails:"Contenu d'emails, fichiers ou captures d'écran",
+      row_raw_timeline:"Rétention de l'historique brut",
+      chip_metadata_only:"métadonnées seulement", chip_project_level:"niveau projet", chip_never_collected:"jamais collecté",
+      val_14_days:"14 jours", chip_or_until_confirmed:"ou jusqu'à confirmation",
+      text_data_footer:"Cet historique n'est visible que par vous. L'organisation ne voit que les saisies que vous soumettez. Base légale et analyse d'impact à valider avec le DPO avant le pilote.",
+      btn_delete_timeline:"Supprimer l'historique",
+      dlg_shortcuts_title:"Raccourcis clavier",
+      row_open_close_assistant:"Ouvrir et fermer l'assistant", row_new_quick_add:"Nouvel ajout rapide",
+      row_copy_previous_week:"Copier la semaine précédente", row_prev_next_week:"Semaine précédente et suivante",
+      row_confirm_cell:"Valider la cellule et descendre", row_show_list:"Afficher cette liste"
+    }
+  };
+  function t(key, vars){
+    var d = I18N[state.lang] || I18N.en;
+    var s = (Object.prototype.hasOwnProperty.call(d, key) ? d[key] : I18N.en[key]);
+    if(s === undefined) return key;
+    if(vars) Object.keys(vars).forEach(function(k){ s = s.replace("{" + k + "}", vars[k]); });
+    return s;
+  }
+  /* French pluralises 0 and 1 the same way (singular); English and
+     Portuguese only keep the singular at exactly 1. */
+  function plural(n, key, extraVars){
+    var isOne = state.lang === "fr" ? (n <= 1) : (n === 1);
+    var vars = {n: n};
+    if(extraVars) Object.keys(extraVars).forEach(function(k){ vars[k] = extraVars[k]; });
+    return t(isOne ? key + "_one" : key + "_other", vars);
+  }
+  var WEEKDAY_ABBR_I18N = {
+    en:["Mon","Tue","Wed","Thu","Fri","Sat","Sun"],
+    pt:["Seg","Ter","Qua","Qui","Sex","Sáb","Dom"],
+    fr:["Lun","Mar","Mer","Jeu","Ven","Sam","Dim"]
+  };
+  var MONTHS_I18N = {
+    en:["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"],
+    pt:["Jan","Fev","Mar","Abr","Mai","Jun","Jul","Ago","Set","Out","Nov","Dez"],
+    fr:["Jan","Fév","Mar","Avr","Mai","Juin","Juil","Août","Sep","Oct","Nov","Déc"]
+  };
+  /* Full month names for display (the "September 2026" month-view label),
+     kept separate from MONTHS_NLP below: that one stays English-only, it
+     drives the natural-language regex parser, which doesn't understand
+     other languages yet regardless of the UI language selected here. */
+  var MONTHS_FULL_I18N = {
+    en:["January","February","March","April","May","June","July","August","September","October","November","December"],
+    pt:["Janeiro","Fevereiro","Março","Abril","Maio","Junho","Julho","Agosto","Setembro","Outubro","Novembro","Dezembro"],
+    fr:["Janvier","Février","Mars","Avril","Mai","Juin","Juillet","Août","Septembre","Octobre","Novembre","Décembre"]
+  };
+  function monthFullName(i){ return (MONTHS_FULL_I18N[state.lang] || MONTHS_FULL_I18N.en)[i]; }
+  /* Re-points the two lookup arrays at the current language and rebuilds
+     the cached weekday+date labels (DAYS) that were computed from the old
+     ones - called on load and every time the language changes. */
+  function applyLocaleArrays(){
+    WEEKDAY_ABBR = WEEKDAY_ABBR_I18N[state.lang] || WEEKDAY_ABBR_I18N.en;
+    MONTHS = MONTHS_I18N[state.lang] || MONTHS_I18N.en;
+    if(typeof WORKDATES !== "undefined" && WORKDATES.length) DAYS = daysFor(WORKDATES);
+  }
+  /* Walks every element carrying a data-i18n* attribute and applies the
+     current language. Static text (data-i18n) is the vast majority;
+     data-i18n-title/placeholder/aria set the matching attribute instead,
+     and data-i18n-html allows the handful of strings with inline markup
+     (<strong>, <span class="num">) to use innerHTML instead of textContent. */
+  function applyI18n(){
+    document.querySelectorAll("[data-i18n]").forEach(function(elm){
+      elm.textContent = t(elm.getAttribute("data-i18n"));
+    });
+    document.querySelectorAll("[data-i18n-html]").forEach(function(elm){
+      elm.innerHTML = t(elm.getAttribute("data-i18n-html"));
+    });
+    document.querySelectorAll("[data-i18n-title]").forEach(function(elm){
+      elm.title = t(elm.getAttribute("data-i18n-title"));
+    });
+    document.querySelectorAll("[data-i18n-placeholder]").forEach(function(elm){
+      elm.placeholder = t(elm.getAttribute("data-i18n-placeholder"));
+    });
+    document.querySelectorAll("[data-i18n-aria]").forEach(function(elm){
+      elm.setAttribute("aria-label", t(elm.getAttribute("data-i18n-aria")));
+    });
+    document.querySelectorAll("[data-wd]").forEach(function(elm){
+      elm.textContent = WEEKDAY_ABBR[+elm.getAttribute("data-wd")];
+    });
+    if($("captureTxt")) $("captureTxt").textContent = state.privateMode ? t("capture_off") : t("capture_on");
+    if(typeof updateApproverChrome === "function") updateApproverChrome();
+    if($("dlgDetail") && $("dlgDetail").open && $("dtProj") && $("dtProj").value !== "") updateDescPlaceholder(+$("dtProj").value);
+    if(typeof refreshAssistantForLang === "function") refreshAssistantForLang();
+    document.documentElement.lang = state.lang;
+  }
+  function setLang(lang){
+    if(!I18N[lang]) return;
+    state.lang = lang;
+    try{ localStorage.setItem("vesiLang", lang); }catch(e){}
+    applyLocaleArrays();
+    applyI18n();
+    render();
+    if($("screen-team") && !$("screen-team").hidden) renderTeam();
+    if($("screen-aprov") && !$("screen-aprov").hidden) renderApprovals();
+    if($("screen-cats") && !$("screen-cats").hidden){ renderCats(); renderMap(); }
+  }
+
+  /* Sofia's (PT01, Consulting) and Marco's (PT02, Building Solutions) own
+     approval queues - swapped into state.approvals on company switch, the
+     same way WEEKS is, so the Approval screen reflects whichever company
+     IT0001 currently reads instead of always showing Consulting. */
+  var APPROVALS_PT01 = [
+    {who:"Ana Ferreira", role:"Senior consultant", proj:"BNK-2026", tot:40, inproj:36, dev:0, warn:0, sel:false, days:[8,8,8,8,8]},
+    {who:"Bruno Matos", role:"Consultant", proj:"RTL-TT", tot:38.5, inproj:34, dev:-1.5, warn:0, sel:false, days:[8,8,8,8,6.5]},
+    {who:"Carla Nunes", role:"Consultant", proj:"AER-WFM", tot:40, inproj:40, dev:0, warn:0, sel:false, days:[8,8,8,8,8]},
+    {who:"Diogo Sousa", role:"Junior consultant", proj:"BNK-2026", tot:37, inproj:30, dev:-3, warn:0, sel:false, days:[8,8,8,8,5]},
+    {who:"Eva Lopes", role:"Architect", proj:"RTL-TT", tot:40, inproj:40, dev:0, warn:1, sel:false, note:"Pending leave request overlaps recorded hours", days:[8,8,8,8,8]},
+    {who:"Filipe Reis", role:"Consultant", proj:"AER-WFM", tot:24, inproj:18, dev:-16, warn:1, sel:false, note:"Two empty working days", days:[8,8,0,8,0]}
+  ];
+  var APPROVALS_PT02 = [
+    {who:"Nuno Dias", role:"Technician", proj:"HSP-FAC", tot:40, inproj:40, dev:0, warn:0, sel:false, days:[8,8,8,8,8]},
+    {who:"Hélder Rocha", role:"Technician", proj:"HSP-FAC", tot:18, inproj:18, dev:-12, warn:0, sel:false, days:[0,0,6,6,6]},
+    {who:"Luís Teixeira", role:"Technician", proj:"HSP-FAC", tot:24, inproj:24, dev:-8, warn:0, sel:false, days:[8,8,8,0,0]},
+    {who:"Ana Pires", role:"Technician", proj:"AER-FAC", tot:16, inproj:16, dev:-16, warn:0, sel:false, days:[8,8,0,0,0]},
+    {who:"Hugo Matos", role:"Technician", proj:"HSP-FAC", tot:24, inproj:24, dev:-8, warn:1, sel:false, note:"Pending leave request overlaps recorded hours", days:[8,0,8,8,0]},
+    {who:"Carla Sousa", role:"Senior technician", proj:"AER-FAC", tot:16, inproj:16, dev:-16, warn:1, sel:false, note:"Two empty working days", days:[0,8,8,0,0]}
+  ];
+  var state = {
+    lang: (function(){
+      try{
+        var saved = localStorage.getItem("vesiLang");
+        return I18N[saved] ? saved : "en";
+      }catch(e){ return "en"; }
+    })(),
+    submitted: WEEKS[weekIdx].submitted,
+    /* True whenever there's an edit (to any week, hours or a status
+       change) not yet confirmed with Save: set on every hour-cell edit,
+       template/suggestion/quick-add/chat entry, and on Submit itself
+       (submitting changes the week's status, which also needs saving).
+       Only Save clears it - navigating to a different week doesn't,
+       since the pending work isn't tied to whichever week is on screen. */
+    needsSave: false,
+    privateMode:false,
+    rows: WEEKS[weekIdx].rows,
+    allow: WEEKS[weekIdx].allow,
+    sugs: WEEKS[weekIdx].sugs,
+    deviationNote: WEEKS[weekIdx].deviationNote || "",
+    leader: "RN",
+    staged: {},
+    stagedAllow: [],
+    massLog: [],
+    /* Same idea as needsSave, but for the Team screen's own leader-side
+       action, kept separate so one person's pending work never shows as
+       "unsaved" on someone else's screen: "Save staged entries"/"Save
+       staged allowances" only move data from staged into massLog (the
+       "Recorded on behalf" log) - not yet reflected in the database, that
+       still needs the header Save. Bonus is excluded on purpose, it's
+       recorded and approved in the same click, there's nothing staged. */
+    teamNeedsSave: false,
+    /* massLog is append-only (see the beforeLog = massLog.length pattern
+       already used for the assistant's own flows below), so "everything
+       from this index on is still unsaved" is enough to mark exactly
+       which recorded-but-not-saved hours entries a cell should highlight,
+       even once they're no longer in state.staged - a mass fill that goes
+       straight to massLog (the assistant's team fill does, it never
+       leaves anything sitting in staged) would otherwise show no marker
+       at all once it's recorded. */
+    teamSavedThrough: 0,
+    /* pure display state, not part of the timesheet data: which mass-entry
+       tab is showing, and whether the person has manually opened/closed
+       Suggestions this session (null = follow the automatic empty/non-empty
+       guess) */
+    teamTab: "hours",
+    sugManualOpen: null,
+    allowManualOpen: null,
+    /* which top-level screen is showing right now: "semana" (My week),
+       "team", "aprov" or "cats" - lets the assistant tell a personal
+       request from a team one when the wording alone is ambiguous */
+    screen: "semana",
+    approvals: APPROVALS_PT01
+  };
+
+  var $ = function(id){ return document.getElementById(id); };
+  var nextId = 100;
+
+  function fmt(n){ return (Math.round(n*100)/100).toFixed(1); }
+  function parseDur(txt){
+    if(!txt) return 0;
+    var t = String(txt).trim().toLowerCase().replace(",", ".");
+    if(!t) return 0;
+    var m;
+    if((m = t.match(/^(\d{1,2}):(\d{1,2})$/))) return (+m[1]) + (+m[2])/60;
+    if((m = t.match(/^(\d+(?:\.\d+)?)\s*m(?:in)?$/))) return (+m[1])/60;
+    if((m = t.match(/^(\d+(?:\.\d+)?)\s*h?$/))) return +m[1];
+    return NaN;
+  }
+  function round15(v){ return Math.round(v*4)/4; }
+
+  function rowTotal(r){ return r.h.reduce(function(a,b){ return a+(b||0); },0); }
+  function dayTotal(d){ return state.rows.reduce(function(a,r){ return a+(r.h[d]||0); },0); }
+  function weekTotal(){ return state.rows.reduce(function(a,r){ return a+rowTotal(r); },0); }
+  function projTotal(){
+    return state.rows.reduce(function(a,r){ return a + (PROJECTS[r.p].proj ? rowTotal(r) : 0); },0);
+  }
+
+  /* ---------- validation ---------- */
+  function validate(){
+    var out = [];
+    for(var d=0; d<7; d++){
+      if(dayTotal(d) > 24) out.push({sev:"e", txt:t("val_day_exceeds_24h", {day: DAYS[d]}), day:d});
+    }
+    state.rows.forEach(function(r){
+      if(PROJECTS[r.p].proj && rowTotal(r) > 0 && r.desc.trim().length < 10){
+        out.push({sev:"e", txt:t("val_desc_required", {code: PROJECTS[r.p].code}), row:r.id});
+      }
+    });
+    /* Never past the day's capacity - the person's daily schedule, reduced
+       further by an approved absence when there is one. The field-level
+       check in durCell keeps this from happening through the UI; this is
+       the same rule enforced again for whatever reaches state.rows some
+       other way (Quick add, the assistant, a suggestion accepted). */
+    for(var a=0; a<5; a++){
+      var cap = capacity(a), tot = dayTotal(a);
+      if(tot === 0) continue;
+      if(cap === 0 && absHours(a) > 0){
+        out.push({sev:"e", day:a, conflict:a,
+          txt:t("val_absence_move_hours", {day: DAYS[a], type: absOn(a,"approved")[0].type.toLowerCase(), h: fmt(tot)})});
+      } else if(tot > cap){
+        out.push({sev:"e", day:a,
+          txt: absHours(a) > 0
+            ? t("val_partial_absence_capacity", {day: DAYS[a], cap: fmt(cap), tot: fmt(tot)})
+            : t("val_day_capacity", {day: DAYS[a], cap: fmt(cap), tot: fmt(tot)})});
+      }
+    }
+    for(var p=0; p<5; p++){
+      if(absOn(p,"pending").length && dayTotal(p) > 0){
+        out.push({sev:"w", day:p, txt:t("val_pending_leave_conflict", {day: DAYS[p]})});
+      }
+    }
+    for(var i=0; i<5; i++){
+      if(capacity(i) > 0 && dayTotal(i) === 0) out.push({sev:"w", txt:t("val_day_empty", {day: DAYS[i]}), day:i});
+    }
+    var expect = weekCapacity();
+    if(weekTotal() > 0 && weekTotal() < expect) out.push({sev:"w", txt:t("val_week_below_expected", {tot: fmt(weekTotal()), expect: fmt(expect)})});
+    /* closed periods, monthly and per company */
+    for(var c=0; c<7; c++){
+      if(dayTotal(c) > 0 && !periodOpen(WORKDATES[c])){
+        out.push({sev:"e", day:c, txt:t("val_closed_period", {day: DAYS[c], ym: periodFor(WORKDATES[c]).ym, bukrs: IT0001.bukrs})});
+      }
+    }
+    /* overlapping windows, only in the profile that records start and end */
+    if(isClock()){
+      for(var o=0; o<7; o++){
+        var hits = clockOverlaps(o);
+        if(hits.length){
+          out.push({sev:"e", day:o, txt:t("val_overlapping_windows", {day: DAYS[o], t1: fmtClock(hits[0][0].b), t2: fmtClock(hits[0][0].e%1440), t3: fmtClock(hits[0][1].b), t4: fmtClock(hits[0][1].e%1440)})});
+        }
+      }
+      state.rows.forEach(function(r){
+        for(var i=0; i<7; i++){
+          var s = slot(r,i);
+          if(s && (s.b === null) !== (s.e === null)){
+            out.push({sev:"e", row:r.id, day:i, txt:t("val_window_needs_both", {day: DAYS[i], code: PROJECTS[r.p].code})});
+          }
+        }
+      });
+    }
+    /* allowances on this employee's own sheet */
+    myAllow().forEach(function(a){
+      var w = wt(a.code);
+      if(!w) return;
+      if(w.noteLabel && !String(a.note || "").trim()){
+        out.push({sev:"e", allow:a.id, txt:t("val_allow_note_needed", {name: w.name, day: DAYS[a.day], noteLabel: w.noteLabel.toLowerCase()})});
+      }
+      if(!periodOpen(WORKDATES[a.day])){
+        out.push({sev:"e", allow:a.id, txt:t("val_allow_closed_period", {name: w.name, day: DAYS[a.day]})});
+      }
+      if(w.amount && !(a.amount > 0)){
+        out.push({sev:"e", allow:a.id, txt:t("val_allow_no_amount", {name: w.name, day: DAYS[a.day]})});
+      }
+      if(!w.amount && !(a.qty > 0)){
+        out.push({sev:"e", allow:a.id, txt:t("val_allow_no_qty", {name: w.name, day: DAYS[a.day]})});
+      }
+    });
+    var pend = visibleSugs().length;
+    if(pend > 0 && !state.privateMode) out.push({sev:"i", txt:plural(pend, "n_suggestions_to_review2")});
+    return out;
+  }
+  function errors(){ return validate().filter(function(m){ return m.sev === "e"; }); }
+
+  /* ---------- start and end, profile Z_BSRV ----------
+     Stored per row and day as {b, e} in minutes, written to BEGUZ and ENDUZ.
+     The duration is always computed and never editable in this profile, and
+     the three values are all kept so nothing downstream has to recalculate. */
+  function parseClock(txt){
+    if(txt === null || txt === undefined) return null;
+    var t = String(txt).trim();
+    if(!t) return null;
+    var m = t.replace(/[.hH]/g, ":").match(/^(\d{1,2})(?::(\d{1,2}))?$/);
+    if(!m) return NaN;
+    var h = +m[1], mi = m[2] === undefined ? 0 : +m[2];
+    if(h > 23 || mi > 59) return NaN;
+    return h*60 + mi;
+  }
+  function fmtClock(min){
+    if(min === null || min === undefined) return "";
+    var h = Math.floor(min/60), m = min%60;
+    return (h<10?"0":"") + h + ":" + (m<10?"0":"") + m;
+  }
+  function slot(r, i){
+    if(!r.t) r.t = [null,null,null,null,null,null,null];
+    return r.t[i];
+  }
+  function setSlot(r, i, s){
+    if(!r.t) r.t = [null,null,null,null,null,null,null];
+    r.t[i] = s;
+  }
+  function slotHours(s){
+    if(!s || s.b === null || s.e === null) return 0;
+    var d = s.e - s.b;
+    if(d < 0) d = profileFor(WORKDATES[0]).overnight ? d + 1440 : 0;
+    /* Every clock window is assumed to carry its own 1h lunch break in the
+       middle, worked hours are the span minus that break. */
+    d = Math.max(0, d - LUNCH_MIN);
+    return round15(d/60);
+  }
+  /* Recomputes every duration from the time window. Called whenever a window
+     changes and once when the profile switches to Z_BSRV. */
+  function syncClock(){
+    state.rows.forEach(function(r){
+      for(var i=0; i<7; i++){
+        var s = slot(r,i);
+        if(s) r.h[i] = slotHours(s);
+      }
+    });
+  }
+  /* Overlapping windows on the same day, only meaningful in Z_BSRV. */
+  function clockOverlaps(day){
+    var slots = [];
+    state.rows.forEach(function(r){
+      var s = slot(r,day);
+      if(s && s.b !== null && s.e !== null) slots.push({b:s.b, e:s.e < s.b ? s.e + 1440 : s.e, p:r.p});
+    });
+    slots.sort(function(a,b){ return a.b - b.b; });
+    var hits = [];
+    for(var i=1; i<slots.length; i++){
+      if(slots[i].b < slots[i-1].e) hits.push([slots[i-1], slots[i]]);
+    }
+    return hits;
+  }
+
+  /* The one gate a self-entry cell has to pass to stay editable: the week
+     isn't submitted, its period isn't closed, and it isn't a day an approved
+     absence already fills (unless it already carries a value, so an old
+     entry stays visible and removable even if an absence landed on it
+     afterwards). durCell and clockCell each computed this the same way. */
+  function cellLocked(day, v){
+    return state.submitted || !periodOpen(WORKDATES[day]) || (isBlocked(day) && !v);
+  }
+  function durCell(r, i, v, pr){
+    var inp = document.createElement("input");
+    inp.type = "text";
+    inp.className = "cell" + dayExtraClass(i);
+    inp.id = "c-"+r.id+"-"+i;
+    inp.value = v ? fmt(v) : "";
+    inp.inputMode = "decimal";
+    inp.setAttribute("aria-label","Duration in hours, "+pr.name+", "+DAYS[i]);
+    inp.disabled = cellLocked(i, v);
+    decorateCell(inp, i, v);
+    inp.addEventListener("change", function(){
+      var parsed = parseDur(inp.value);
+      if(isNaN(parsed)){ toast(t("toast_bad_duration", {v: inp.value})); inp.value = v ? fmt(v) : ""; return; }
+      var newVal = round15(parsed);
+      /* Never exceed the day's capacity - the person's daily schedule,
+         reduced further by an approved absence when there is one. Block
+         it here, at the field, instead of only flagging it once the
+         week is validated: the app should never let the limit pass. */
+      var otherTotal = dayTotal(i) - (r.h[i] || 0);
+      var cap = capacity(i);
+      if(otherTotal + newVal > cap){
+        var abs = absOn(i, "approved")[0];
+        var left = Math.max(0, cap - otherTotal);
+        var msg = abs
+          ? t("msg_day_approved_type", {day: DAYS[i], type: abs.type.toLowerCase()})
+          : t("msg_day_capacity_simple", {day: DAYS[i], cap: fmt(cap)});
+        toast(msg + (left > 0 ? t("toast_only_available", {left: fmt(left)}) : t("toast_no_hours_available")));
+        inp.value = v ? fmt(v) : "";
+        return;
+      }
+      r.h[i] = newVal;
+      state.needsSave = true;
+      render();
+    });
+    inp.addEventListener("keydown", function(ev){
+      if(ev.key === "Enter" && !ev.ctrlKey && !ev.metaKey){
+        ev.preventDefault(); inp.blur();
+        var idx = state.rows.indexOf(r);
+        var nxt = state.rows[idx+1];
+        setTimeout(function(){
+          var t = nxt ? document.getElementById("c-"+nxt.id+"-"+i) : document.getElementById("c-"+r.id+"-"+Math.min(i+1,6));
+          if(t) t.focus();
+        },0);
+      }
+    });
+    return inp;
+  }
+
+  function clockCell(r, i, v, pr){
+    var box = el("div","clockcell" + dayExtraClass(i), "");
+    var s = slot(r,i);
+    var locked = cellLocked(i, v);
+    ["b","e"].forEach(function(k){
+      var inp = document.createElement("input");
+      inp.type = "text";
+      inp.className = "tinp";
+      inp.id = "c-"+r.id+"-"+i+(k === "b" ? "" : "-e");
+      inp.value = s ? fmtClock(s[k]) : "";
+      inp.placeholder = k === "b" ? "start" : "end";
+      inp.inputMode = "numeric";
+      inp.disabled = locked;
+      inp.setAttribute("aria-label", (k === "b" ? "Start time, " : "End time, ") + pr.name + ", " + DAYS[i]);
+      inp.addEventListener("change", function(){
+        var parsed = parseClock(inp.value);
+        if(isNaN(parsed)){ toast(t("toast_bad_clock", {v: inp.value})); render(); return; }
+        var cur = slot(r,i) || {b:null, e:null};
+        var prev = cur[k];
+        cur[k] = parsed;
+        var newVal = (cur.b === null && cur.e === null) ? 0 : slotHours(cur);
+        /* Same hard rule as durCell: never let a day go over capacity, not
+           even with a warning - refuse it here instead, before the window
+           is ever stored. */
+        var otherTotal = dayTotal(i) - (r.h[i] || 0);
+        var cap = capacity(i);
+        if(otherTotal + newVal > cap){
+          var abs = absOn(i, "approved")[0];
+          var left = Math.max(0, cap - otherTotal);
+          var msg = abs
+            ? t("msg_day_approved_type", {day: DAYS[i], type: abs.type.toLowerCase()})
+            : t("msg_day_capacity_simple", {day: DAYS[i], cap: fmt(cap)});
+          toast(msg + (left > 0 ? t("toast_only_available", {left: fmt(left)}) : t("toast_no_hours_available")));
+          cur[k] = prev;
+          render();
+          return;
+        }
+        if(cur.b === null && cur.e === null) setSlot(r,i,null); else setSlot(r,i,cur);
+        syncClock();
+        state.needsSave = true;
+        render();
+      });
+      box.appendChild(inp);
+    });
+    var d = el("div","cdur", v ? fmt(v) + " h" : "–");
+    if(s && s.b !== null && s.e !== null && s.e < s.b) d.textContent = fmt(v) + " h +1";
+    box.appendChild(d);
+    decorateCell(box, i, v);
+    return box;
+  }
+
+  function decorateCell(node, i, v){
+    if(!periodOpen(WORKDATES[i])){
+      node.classList.add("closed");
+      node.title = t("tip_period_closed", {ym: periodFor(WORKDATES[i]).ym, bukrs: IT0001.bukrs});
+    } else if(isBlocked(i)){
+      node.classList.add("abs");
+      node.title = t("tip_absence_not_available", {type: absOn(i,"approved")[0].type.toLowerCase()});
+    } else if(absHours(i) > 0){
+      node.title = t("tip_approved_partial_absence", {h: fmt(capacity(i))});
+    }
+  }
+
+  /* ---------- render: grid ---------- */
+  function renderGrid(){
+    var g = $("tsgrid");
+    g.innerHTML = "";
+    g.className = "tsgrid" + (isClock() ? " clock" : "");
+
+    var head = document.createElement("div");
+    head.className = "row head";
+    head.appendChild(el("div","",t("th_project_wbs_activity")));
+    DAYS.forEach(function(d,i){
+      var c = el("div", dayExtraClass(i).trim(), "");
+      appendDayLabel(c, i);
+      var ap = absOn(i,"approved")[0], pe = absOn(i,"pending")[0];
+      if(ap) c.appendChild(dayAbsBadge(ap, capacity(i) === 0 ? ap.type : t("badge_half_day"), capacity(i) === 0 ? " full" : ""));
+      else if(pe) c.appendChild(dayAbsBadge(pe, "pending", " pend"));
+      head.appendChild(c);
+    });
+    head.appendChild(el("div","",t("th_total")));
+    head.appendChild(el("div","",""));
+    g.appendChild(head);
+
+    if(state.rows.length === 0){
+      var e = document.createElement("div");
+      e.className = "empty";
+      e.innerHTML = '<p><strong>'+t("text_no_hours_week_yet")+'</strong> '+t("text_shortest_path")+'</p>';
+      var acts = el("div","acts","");
+      acts.appendChild(btn(t("btn_copy_last_week"),"btn primary", copyWeek));
+      acts.appendChild(btn("Review "+state.sugs.length+" suggestions","btn", function(){ $("sugPanel").scrollIntoView({block:"center"}); }));
+      acts.appendChild(btn(t("btn_add_first_project"),"btn", addRow));
+      e.appendChild(acts);
+      g.appendChild(e);
+    }
+
+    state.rows.forEach(function(r){
+      var pr = PROJECTS[r.p];
+      var row = document.createElement("div");
+      row.className = "row" + (state.submitted ? " locked" : "");
+
+      var meta = el("div","rowmeta","");
+      var p = el("div","p","");
+      p.appendChild(el("span","", pr.name));
+      var c = document.createElement("code"); c.textContent = pr.wbs || pr.sap.rkostl; p.appendChild(c);
+      p.appendChild(el("span","bill" + (pr.proj?"":" no"), pr.proj ? "PEP" : "INTERNAL"));
+      meta.appendChild(p);
+      var needDesc = pr.proj && rowTotal(r) > 0 && r.desc.trim().length < 10;
+      var s = el("div","s", (r.desc || (needDesc ? t("text_desc_required") : t("text_no_description"))) + " · " + pr.act);
+      if(needDesc) s.style.color = "var(--crit)";
+      meta.appendChild(s);
+      meta.style.cursor = "pointer";
+      meta.onclick = function(){ openDetail(r); };
+      row.appendChild(meta);
+
+      r.h.forEach(function(v,i){
+        row.appendChild(isClock() ? clockCell(r,i,v,pr) : durCell(r,i,v,pr));
+      });
+
+      row.appendChild(el("div","rowtot", rowTotal(r) ? fmt(rowTotal(r)) : "–"));
+      var act = el("div","rowact","");
+      var rm = btn("×","", function(){
+        state.rows = state.rows.filter(function(x){ return x.id !== r.id; });
+        render(); toast(t("toast_row_removed"), t("ui_undo"), function(){ state.rows.push(r); render(); });
+      });
+      rm.setAttribute("aria-label",t("aria_remove_row", {name: pr.name}));
+      rm.disabled = state.submitted;
+      act.appendChild(rm);
+      row.appendChild(act);
+      g.appendChild(row);
+    });
+
+    if(state.rows.length){
+      var tr = document.createElement("div");
+      tr.className = "row totals";
+      tr.appendChild(el("div","rowmeta",t("row_total_per_day")));
+      for(var d=0; d<7; d++){
+        var v = dayTotal(d), cap = capacity(d);
+        var cls = "t";
+        if(v > 24 || (d < 5 && v > cap)) cls += " over";
+        else if(v === 0 && d < 5 && cap > 0) cls += " zero";
+        else if(d < 5 && cap === 0) cls += " off";
+        cls += dayExtraClass(d);
+        tr.appendChild(el("div", cls, d < 5 && cap === 0 && !v ? "–" : (v ? fmt(v) : "0.0")));
+      }
+      tr.appendChild(el("div","t", fmt(weekTotal())));
+      tr.appendChild(el("div","",""));
+      g.appendChild(tr);
+    }
+  }
+
+  /* ---------- render: monthly grid, consulting only ----------
+     One row per project for the whole month; hours still live on the
+     underlying week's own row (created lazily on first edit in a week
+     that doesn't have one yet), read/written through the week-scoped
+     helpers above so a cell always uses its own week's capacity and
+     absences, never whichever week the rest of the app is pointed at. */
+  function monthDayLabel(week, i){ return WEEKDAY_ABBR[i] + " " + (+datesFor(week.start)[i].slice(6,8)); }
+  function dayAbsBadgeOf(week, a, label, extraClass){
+    var b = el("button","dayabs" + extraClass, label);
+    b.type = "button";
+    b.setAttribute("aria-label", a.type + ", " + monthDayLabel(week, a.day) + ", " + absStatusLabel(a.status).toLowerCase());
+    b.onmouseenter = function(){ withWeek(week, function(){ showAbsTip(a, b); }); };
+    b.onmouseleave = hideAbsTip;
+    b.onfocus = function(){ withWeek(week, function(){ showAbsTip(a, b); }); };
+    b.onblur = hideAbsTip;
+    return b;
+  }
+  function monthDecorateCell(node, week, i){
+    var dates = datesFor(week.start);
+    var extra = monthDayExtraClass(i, dates[i]).trim();
+    if(extra) node.classList.add.apply(node.classList, extra.split(" "));
+    if(week.submitted){
+      node.classList.add("submitted");
+      node.title = "Week " + week.num + " was already submitted, not editable.";
+    } else if(!periodOpen(dates[i])){
+      node.classList.add("closed");
+      node.title = t("tip_period_closed", {ym: periodFor(dates[i]).ym, bukrs: IT0001.bukrs});
+    } else if(isBlockedOf(week, i)){
+      node.classList.add("abs");
+      var ap = week.absences.filter(function(a){ return a.day === i && a.status === "approved"; })[0];
+      node.title = t("tip_absence_not_available", {type: ap ? ap.type.toLowerCase() : t("text_absence_generic")});
+    } else if(absHoursOf(week, i) > 0){
+      node.title = t("tip_approved_partial_absence", {h: fmt(capacityOf(week,i))});
+    }
+  }
+  function monthDurCell(monthRow, week, i, pr){
+    var existing = monthRowIn(week, monthRow.p);
+    var v = existing ? (existing.h[i] || 0) : 0;
+    var inp = document.createElement("input");
+    inp.type = "text";
+    inp.className = "cell";
+    inp.value = v ? fmt(v) : "";
+    inp.inputMode = "decimal";
+    inp.setAttribute("aria-label","Duration in hours, "+pr.name+", "+monthDayLabel(week,i));
+    inp.disabled = cellLockedOf(week, i, v);
+    monthDecorateCell(inp, week, i);
+    inp.addEventListener("change", function(){
+      var parsed = parseDur(inp.value);
+      if(isNaN(parsed)){ toast(t("toast_bad_duration", {v: inp.value})); inp.value = v ? fmt(v) : ""; return; }
+      var newVal = round15(parsed);
+      var row0 = monthRowIn(week, monthRow.p);
+      var otherTotal = dayTotalOf(week, i) - (row0 ? (row0.h[i]||0) : 0);
+      var cap = capacityOf(week, i);
+      if(otherTotal + newVal > cap){
+        var abs = week.absences.filter(function(a){ return a.day === i && a.status === "approved"; })[0];
+        var left = Math.max(0, cap - otherTotal);
+        var dayLabel = monthDayLabel(week, i);
+        var msg = abs ? t("msg_day_approved_type", {day: dayLabel, type: abs.type.toLowerCase()}) : t("msg_day_capacity_simple", {day: dayLabel, cap: fmt(cap)});
+        toast(msg + (left > 0 ? t("toast_only_available", {left: fmt(left)}) : t("toast_no_hours_available")));
+        inp.value = v ? fmt(v) : "";
+        return;
+      }
+      var row = monthRowIn(week, monthRow.p);
+      if(!row){
+        row = {id:nextId++, p:monthRow.p, desc:monthRow.desc || "", h:[0,0,0,0,0,0,0], origin:"Manual"};
+        week.rows.push(row);
+      }
+      row.h[i] = newVal;
+      state.needsSave = true;
+      render();
+    });
+    return inp;
+  }
+  function renderMonthGrid(){
+    var g = $("tsgrid");
+    g.innerHTML = "";
+    g.className = "tsgrid month";
+    var dates = activeMonthDates();
+    var weeks = touchedWeeksFor(dates);
+    var dayCols = dates.length;
+    var gridCols = "minmax(230px,1fr) repeat(" + dayCols + ",50px) 70px 34px";
+    g.style.minWidth = (230 + dayCols*50 + 70 + 34) + "px";
+
+    var head = document.createElement("div");
+    head.className = "row head";
+    head.style.gridTemplateColumns = gridCols;
+    head.appendChild(el("div","",t("th_project_wbs_activity")));
+    dates.forEach(function(dateISO){
+      var wd = weekDayFor(dateISO);
+      var c = el("div", monthDayExtraClass(wd.day, dateISO).trim(), "");
+      c.appendChild(el("span","dname", WEEKDAY_ABBR[wd.day]));
+      c.appendChild(el("span","dnum", "" + (+dateISO.slice(6,8))));
+      var ap = wd.week.absences.filter(function(a){ return a.day===wd.day && a.status==="approved"; })[0];
+      var pe = wd.week.absences.filter(function(a){ return a.day===wd.day && a.status==="pending"; })[0];
+      if(ap) c.appendChild(dayAbsBadgeOf(wd.week, ap, capacityOf(wd.week,wd.day)===0 ? ap.type : t("badge_half_day"), capacityOf(wd.week,wd.day)===0 ? " full" : ""));
+      else if(pe) c.appendChild(dayAbsBadgeOf(wd.week, pe, "pending", " pend"));
+      head.appendChild(c);
+    });
+    head.appendChild(el("div","",t("th_total")));
+    head.appendChild(el("div","",""));
+    g.appendChild(head);
+
+    /* the week-divider row groups consecutive dates that belong to the
+       same underlying week - not fixed at 5 or 7 wide, since a boundary
+       week only contributes however many of its days fall in this month */
+    var sub = document.createElement("div");
+    sub.className = "row monthsub";
+    sub.style.gridTemplateColumns = gridCols;
+    sub.appendChild(el("div","",""));
+    var di = 0;
+    while(di < dates.length){
+      var w0 = weekDayFor(dates[di]).week;
+      var span = 0;
+      while(di+span < dates.length && weekDayFor(dates[di+span]).week === w0) span++;
+      var label = el("div","monthweeklabel","Week "+w0.num);
+      label.style.gridColumn = "span " + span;
+      sub.appendChild(label);
+      di += span;
+    }
+    sub.appendChild(el("div","",""));
+    sub.appendChild(el("div","",""));
+    g.appendChild(sub);
+
+    var monthRows = monthProjectRows(weeks);
+    var allSubmitted = weeks.every(function(w){ return w.submitted; });
+
+    if(monthRows.length === 0){
+      var e = document.createElement("div");
+      e.className = "empty";
+      e.innerHTML = '<p><strong>'+t("text_no_hours_month_yet")+'</strong> '+t("text_shortest_path")+'</p>';
+      var acts = el("div","acts","");
+      acts.appendChild(btn(t("btn_add_first_project"),"btn", addMonthRow));
+      e.appendChild(acts);
+      g.appendChild(e);
+    }
+
+    monthRows.forEach(function(monthRow){
+      var pr = PROJECTS[monthRow.p];
+      var row = document.createElement("div");
+      row.className = "row" + (allSubmitted ? " locked" : "");
+      row.style.gridTemplateColumns = gridCols;
+
+      var meta = el("div","rowmeta","");
+      var p = el("div","p","");
+      p.appendChild(el("span","", pr.name));
+      var c = document.createElement("code"); c.textContent = pr.wbs || pr.sap.rkostl; p.appendChild(c);
+      p.appendChild(el("span","bill" + (pr.proj?"":" no"), pr.proj ? "PEP" : "INTERNAL"));
+      /* Scoped to the project name/PEP area, not the whole rowmeta - the
+         description right below is its own editable input, and treating
+         a click there as "open the project picker" would just get in the
+         way of typing. This is also the only way to change a month row's
+         project at all: it was never wired up here, unlike the weekly
+         grid's own click-to-open-detail. */
+      p.style.cursor = "pointer";
+      p.onclick = function(){ openMonthDetail(monthRow, weeks); };
+      meta.appendChild(p);
+      var descInp = document.createElement("input");
+      descInp.type = "text";
+      descInp.className = "monthdesc";
+      descInp.placeholder = pr.proj ? t("placeholder_desc_required_once") : t("placeholder_description_short");
+      descInp.value = monthRow.desc || "";
+      descInp.disabled = allSubmitted;
+      descInp.setAttribute("aria-label","Description, "+pr.name);
+      descInp.addEventListener("change", function(){
+        var val = descInp.value;
+        weeks.forEach(function(w){ var r = monthRowIn(w, monthRow.p); if(r) r.desc = val; });
+        render();
+      });
+      meta.appendChild(descInp);
+      row.appendChild(meta);
+
+      var rowTot = 0;
+      dates.forEach(function(dateISO){
+        var wd = weekDayFor(dateISO);
+        var existing = monthRowIn(wd.week, monthRow.p);
+        rowTot += existing ? (existing.h[wd.day]||0) : 0;
+        row.appendChild(monthDurCell(monthRow, wd.week, wd.day, pr));
+      });
+
+      row.appendChild(el("div","rowtot", rowTot ? fmt(rowTot) : "–"));
+      var act = el("div","rowact","");
+      var rm = btn("×","", function(){
+        var removed = [];
+        weeks.forEach(function(w){
+          var r = monthRowIn(w, monthRow.p);
+          if(r){ w.rows = w.rows.filter(function(x){ return x.id !== r.id; }); removed.push({week:w, row:r}); }
+        });
+        render();
+        toast(t("toast_row_removed"), t("ui_undo"), function(){
+          removed.forEach(function(item){ item.week.rows.push(item.row); });
+          render();
+        });
+      });
+      rm.setAttribute("aria-label",t("aria_remove_row", {name: pr.name}));
+      rm.disabled = allSubmitted;
+      act.appendChild(rm);
+      row.appendChild(act);
+      g.appendChild(row);
+    });
+
+    if(monthRows.length){
+      var tr = document.createElement("div");
+      tr.className = "row totals";
+      tr.style.gridTemplateColumns = gridCols;
+      tr.appendChild(el("div","rowmeta",t("row_total_per_day")));
+      dates.forEach(function(dateISO){
+        var wd = weekDayFor(dateISO);
+        var v = dayTotalOf(wd.week, wd.day), cap = capacityOf(wd.week, wd.day);
+        var cls = "t";
+        if(v > 24 || v > cap) cls += " over";
+        else if(v === 0 && cap > 0) cls += " zero";
+        else if(cap === 0) cls += " off";
+        cls += monthDayExtraClass(wd.day, dateISO);
+        tr.appendChild(el("div", cls, cap === 0 && !v ? "–" : (v ? fmt(v) : "0.0")));
+      });
+      tr.appendChild(el("div","t", fmt(monthTotalHours(dates))));
+      tr.appendChild(el("div","",""));
+      g.appendChild(tr);
+    }
+  }
+  function addMonthRow(){
+    var weeks = activeMonthWeeks();
+    if(weeks.every(function(w){ return w.submitted; })){
+      toast(t("toast_month_submitted_no_rows"));
+      return;
+    }
+    var used = {};
+    weeks.forEach(function(w){ w.rows.forEach(function(r){ used[r.p] = true; }); });
+    /* Only a project this company actually does (its own, or a shared one
+       with no bukrs) is eligible - otherwise, once every PT01 project is
+       already on the month, this fell through to the first PT02-only one
+       (Hospital campus) on a Consulting person's own timesheet. The person
+       then picks which of the remaining ones in the dialog - see
+       openNewMonthRowDetail. */
+    var eligible = [];
+    for(var i=0; i<PROJECTS.length; i++){
+      if(!used[i] && (PROJECTS[i].bukrs === IT0001.bukrs || PROJECTS[i].bukrs === null)) eligible.push(i);
+    }
+    if(!eligible.length){
+      toast(t("toast_all_projects_used_month"));
+      return;
+    }
+    var target = weeks.filter(function(w){ return !w.submitted; })[0] || weeks[0];
+    openNewMonthRowDetail(eligible, target, weeks);
+  }
+  function monthList(){
+    var seen = {}, out = [];
+    WEEKS_PT01.forEach(function(w){ var k = monthKeyOf(w); if(!seen[k]){ seen[k] = 1; out.push(k); } });
+    return out;
+  }
+  function changeMonth(delta){
+    var months = monthList();
+    var mi = months.indexOf(monthKeyOf(WEEKS[weekIdx]));
+    var nextMi = mi + delta;
+    if(nextMi < 0 || nextMi >= months.length){
+      toast(delta < 0 ? t("toast_no_earlier_months") : t("toast_no_later_months"));
+      return;
+    }
+    var target = WEEKS.filter(function(w){ return monthKeyOf(w) === months[nextMi]; })[0];
+    saveCurrentWeek();
+    loadWeek(WEEKS.indexOf(target));
+    render();
+  }
+  /* Only Copy previous week and Apply template are hidden for consulting's
+     monthly view - "previous week" and a per-week template don't carry a
+     clear meaning once the whole month is already on screen. Calendar,
+     Quick add, Suggestions and Allowances stay available and keep working
+     exactly as before, against the one week the app is currently pointed
+     at (WEEKS[weekIdx]) - the same week the month grid highlights first. */
+  function applyMonthlyUI(){
+    var monthly = isMonthly();
+    if($("copyWeek")) $("copyWeek").hidden = monthly;
+    if($("tplBtn")) $("tplBtn").hidden = monthly;
+    /* The Calendar view's own hint only holds true week by week - the
+       monthly Calendar is read-only, so telling the user they can click
+       an empty slot there would be wrong. */
+    var calHint = $("calHint");
+    if(calHint){
+      calHint.title = monthly
+        ? "Read-only overview for the month. Log or edit time on the Grid view."
+        : "Click an empty slot to log time that day. Absences and public holidays are not editable.";
+    }
+  }
+
+  /* ---------- render: calendar ---------- */
+  /* Read-only overview, for consulting's monthly view: every week's day
+     laid out side by side on the same hour axis. Editing still happens on
+     the Grid - the blocks here aren't clickable and there's no "+ log
+     time", both of which would otherwise need to know which week a click
+     landed in, the same problem the Grid's own month cells solve with the
+     *Of() helpers; not worth it for a read-only summary. */
+  function renderCalMonth(){
+    var cal = $("cal");
+    cal.innerHTML = "";
+    var dates = activeMonthDates();
+    cal.className = "cal month";
+    cal.style.gridTemplateColumns = "52px repeat(" + dates.length + ",minmax(90px,1fr))";
+    cal.style.minWidth = (52 + dates.length*90) + "px";
+
+    cal.appendChild(el("div","ch","Time"));
+    dates.forEach(function(dateISO){
+      var wd = weekDayFor(dateISO);
+      cal.appendChild(el("div","ch", monthDayLabel(wd.week, wd.day)));
+    });
+
+    var hours = el("div","hours","");
+    for(var h=9; h<19; h++){ hours.appendChild(el("span","", h+":00")); }
+    cal.appendChild(hours);
+
+    dates.forEach(function(dateISO){
+      var wd = weekDayFor(dateISO), w = wd.week, d = wd.day;
+      var col = el("div","col","");
+      w.absences.filter(function(a){ return a.day === d; }).forEach(function(a){
+        var ab = el("div","blk abs" + (a.status === "pending" ? " pend" : ""), "");
+        ab.style.minHeight = Math.max(30, a.hours*26) + "px";
+        ab.appendChild(el("b","", fmt(a.hours)+" h"));
+        ab.appendChild(document.createTextNode(a.type + " · " + absStatusLabel(a.status)));
+        ab.title = a.src + ", AWART " + a.awart;
+        col.appendChild(ab);
+      });
+      var any = false;
+      w.rows.forEach(function(r){
+        var v = r.h[d];
+        if(!v) return;
+        any = true;
+        var pr = PROJECTS[r.p];
+        var b = el("div","blk" + (pr.proj ? "" : " nb"), "");
+        b.style.minHeight = Math.max(30, v*26) + "px";
+        var s = slot(r,d);
+        b.appendChild(el("b","", (isClock() && s && s.b!==null && s.e!==null) ? (fmtClock(s.b)+"–"+fmtClock(s.e%1440)) : fmt(v)+" h"));
+        b.appendChild(document.createTextNode(pr.code + " · " + (r.desc || pr.act)));
+        col.appendChild(b);
+      });
+      if(isBlockedOf(w,d) && !any){
+        col.appendChild(el("div","calfree off","day not available"));
+      }
+      cal.appendChild(col);
+    });
+  }
+  function renderCal(){
+    if(isMonthly()) return renderCalMonth();
+    var cal = $("cal");
+    cal.innerHTML = "";
+    cal.className = "cal";
+    cal.style.gridTemplateColumns = "";
+    cal.style.minWidth = "";
+    cal.appendChild(el("div","ch","Time"));
+    for(var i=0; i<7; i++) cal.appendChild(el("div","ch", DAYS[i]));
+
+    var hours = el("div","hours","");
+    for(var h=9; h<19; h++){ hours.appendChild(el("span","", h+":00")); }
+    cal.appendChild(hours);
+
+    for(var d=0; d<7; d++){
+      var col = el("div","col","");
+      absOn(d).forEach(function(a){
+        var ab = el("div","blk abs" + (a.status === "pending" ? " pend" : ""), "");
+        ab.style.minHeight = Math.max(30, a.hours*26) + "px";
+        ab.appendChild(el("b","", fmt(a.hours)+" h"));
+        ab.appendChild(document.createTextNode(a.type + " · " + absStatusLabel(a.status)));
+        ab.title = a.src + ", AWART " + a.awart;
+        col.appendChild(ab);
+      });
+      /* r.desc is free text the person types in Quick Add or the detail
+         dialog: built with textContent/createTextNode, never innerHTML, so
+         something like "<img onerror=...>" in a description shows up as
+         literal text instead of running. */
+      state.rows.forEach(function(r){
+        var v = r.h[d];
+        if(!v) return;
+        var pr = PROJECTS[r.p];
+        var b = document.createElement("button");
+        b.className = "blk" + (pr.proj ? "" : " nb");
+        b.style.minHeight = Math.max(30, v*26) + "px";
+        var s = slot(r,d);
+        b.appendChild(el("b","", (isClock() && s && s.b!==null && s.e!==null) ? (fmtClock(s.b)+"–"+fmtClock(s.e%1440)) : fmt(v)+" h"));
+        b.appendChild(document.createTextNode(pr.code + " · " + (r.desc || pr.act)));
+        b.onclick = (function(day){ return function(){ openDetail(r, day); }; })(d);
+        col.appendChild(b);
+      });
+      if(!isBlocked(d)){
+        var free = document.createElement("button");
+        free.className = "calfree";
+        free.textContent = "+ log time";
+        free.onclick = (function(day){ return function(){ openQuick("", day); }; })(d);
+        col.appendChild(free);
+      } else {
+        col.appendChild(el("div","calfree off","day not available"));
+      }
+      cal.appendChild(col);
+    }
+  }
+
+  /* ---------- render: suggestions ---------- */
+  function confLabel(level){ return t("conf_" + level); }
+  function visibleSugs(){
+    return state.sugs.filter(function(s){ return !isBlocked(s.day); });
+  }
+  function renderSugs(){
+    var box = $("sugs");
+    box.innerHTML = "";
+    var vis = visibleSugs();
+    var hidden = state.sugs.length - vis.length;
+    $("acceptHi").disabled = state.privateMode || !vis.some(function(s){ return s.conf === "hi"; });
+
+    /* Collapsed when there's nothing to review, open when there is —
+       unless the person has already toggled it themselves this session,
+       which always wins over the automatic guess. */
+    var autoOpen = !state.privateMode && vis.length > 0;
+    setPanelOpen("sugPanel", "sugTog", state.sugManualOpen === null ? autoOpen : state.sugManualOpen);
+
+    if(state.privateMode){
+      var p = el("div","paused","");
+      p.innerHTML = "<strong>Private mode on.</strong><span>Signal capture is paused. Nothing is collected while this mode is on.</span>";
+      p.appendChild(btn(t("btn_resume_suggestions"),"btn", togglePrivate));
+      box.appendChild(p);
+      return;
+    }
+    if(vis.length === 0){
+      box.appendChild(el("div","paused", hidden ? "Nothing to propose. The suggestions that existed fell on days with an approved absence." : "No pending suggestions. Good sign, the week is reviewed."));
+      return;
+    }
+    if(hidden){
+      box.appendChild(el("div","msg i", plural(hidden, "suggestions_discarded")));
+    }
+    vis.forEach(function(s){
+      var pr = PROJECTS[s.p];
+      var card = el("div","sug "+s.conf,"");
+      var h = el("div","h","");
+      var b = document.createElement("b"); b.textContent = fmt(s.hours)+" h"; h.appendChild(b);
+      h.appendChild(el("span","", DAYS[s.day]));
+      card.appendChild(h);
+      card.appendChild(el("div","", pr.name));
+      card.appendChild(el("div","why", s.why));
+      card.appendChild(el("div","conf", confLabel(s.conf)));
+      var acts = el("div","acts","");
+      acts.appendChild(btn("Accept","btn sm primary", function(){ acceptSug(s); }));
+      acts.appendChild(btn("Edit","btn sm", function(){ openQuick(fmt(s.hours)+"h "+pr.code+" "+(s.desc||""), s.day); }));
+      acts.appendChild(btn("Dismiss","btn sm ghost", function(){ dropSug(s, true); }));
+      card.appendChild(acts);
+      box.appendChild(card);
+    });
+  }
+  function acceptSug(s){
+    if(isBlocked(s.day)){ toast(t("toast_sugg_blocked_absence", {day: DAYS[s.day]})); return; }
+    var row = state.rows.filter(function(r){ return r.p === s.p; })[0];
+    if(!row){ row = {id:nextId++, p:s.p, desc:s.desc, h:[0,0,0,0,0,0,0], origin:"Suggested"}; state.rows.push(row); }
+    if(!row.desc) row.desc = s.desc;
+    row.h[s.day] += s.hours;
+    state.needsSave = true;
+    dropSug(s, false);
+    toast(t("toast_suggestion_accepted", {day: DAYS[s.day]}));
+  }
+  function dropSug(s, notify){
+    state.sugs = state.sugs.filter(function(x){ return x.id !== s.id; });
+    render();
+    if(notify) toast(t("toast_suggestion_dismissed"), t("ui_undo"), function(){ state.sugs.push(s); render(); });
+  }
+
+  /* ---------- render: messages, KPIs ---------- */
+  /* Month messages keep the "resolve, move the hours" action (a pure data
+     fix, replayed through withWeek against the message's own week, so it
+     never touches the wrong week's rows) but skip "go to day": the month
+     grid shows project rows, not a per-day cell per row the way the
+     weekly grid does, so there's no single cell to focus. Each line
+     names its week either way. */
+  function renderMsgsMonth(){
+    var dates = activeMonthDates();
+    var weeks = touchedWeeksFor(dates);
+    var list = [];
+    weeks.forEach(function(w){
+      withWeek(w, function(){
+        validate().forEach(function(m){
+          if(typeof m.day === "number" && dates.indexOf(datesFor(w.start)[m.day]) === -1) return;
+          list.push({sev:m.sev, txt:t("val_week_label_prefix", {n: w.num, txt: m.txt}), conflict:m.conflict, week:w, submitted:w.submitted});
+        });
+      });
+    });
+    var box = $("msgs");
+    box.innerHTML = "";
+    $("msgPanel").hidden = list.length === 0;
+    $("msgCount").textContent = plural(list.length, "n_messages");
+    var names = {e:t("sev_error"), w:t("sev_warning"), i:t("sev_info")};
+    list.forEach(function(m){
+      var row = el("div","msg "+m.sev,"");
+      row.appendChild(el("span","ic", names[m.sev]));
+      row.appendChild(el("span","", m.txt));
+      if(typeof m.conflict === "number" && !m.submitted){
+        var fix = btn(t("link_resolve_move_hours"),"", (function(week, day){
+          return function(){ withWeek(week, function(){ resolveConflict(day); }); render(); };
+        })(m.week, m.conflict));
+        fix.style.marginLeft = "auto";
+        row.appendChild(fix);
+      }
+      box.appendChild(row);
+    });
+  }
+  function renderMsgs(){
+    if(isMonthly()) return renderMsgsMonth();
+    var list = validate();
+    var box = $("msgs");
+    box.innerHTML = "";
+    $("msgPanel").hidden = list.length === 0;
+    $("msgCount").textContent = plural(list.length, "n_messages");
+    var names = {e:t("sev_error"), w:t("sev_warning"), i:t("sev_info")};
+    list.forEach(function(m){
+      var row = el("div","msg "+m.sev,"");
+      row.appendChild(el("span","ic", names[m.sev]));
+      var msgSpan = el("span","", m.txt);
+      row.appendChild(msgSpan);
+      if(typeof m.conflict === "number" && !state.submitted){
+        var fix = btn(t("link_resolve_move_hours"),"", (function(day){ return function(){ resolveConflict(day); }; })(m.conflict));
+        fix.style.marginLeft = "auto";
+        row.appendChild(fix);
+      } else if(typeof m.day === "number" && !state.submitted){
+        var go = btn(t("link_go_to_day"),"", function(){
+          var r0 = state.rows[0];
+          if(r0){ var c = document.getElementById("c-"+r0.id+"-"+m.day); if(c) c.focus(); }
+        });
+        go.style.marginLeft = "auto";
+        row.appendChild(go);
+      }
+      box.appendChild(row);
+    });
+    return list.filter(function(m){ return m.sev === "e"; }).length;
+  }
+  function renderKpisMonth(){
+    var dates = activeMonthDates();
+    var weeks = touchedWeeksFor(dates);
+    var ym = monthKeyOf(WEEKS[weekIdx]);
+    var y = ym.slice(0,4), mIdx = +ym.slice(4,6) - 1;
+    /* A clean month selector, not a week one - the week numbers already
+       label their own columns in the grid below, repeating them here read
+       as if this picked a week, not a month. */
+    var monthName = monthFullName(mIdx);
+    var label = monthName + " " + y;
+    $("weekLabel").textContent = label;
+    var months = monthList();
+    var mi = months.indexOf(ym);
+    $("prevW").disabled = mi <= 0;
+    $("nextW").disabled = mi >= months.length - 1;
+    /* Team keeps its own week-by-week navigator even when My week steps by
+       month for consulting - a leader stepping through the team's log
+       still needs single weeks, so this mirrors the *week*, not the month. */
+    if($("weekLabel2")) $("weekLabel2").textContent = weekLabelFor(WORKDATES, WEEKS[weekIdx].num);
+    var teamRange = teamWeekRange();
+    if($("prevW2")) $("prevW2").disabled = weekIdx <= teamRange.lo;
+    if($("nextW2")) $("nextW2").disabled = weekIdx >= teamRange.hi;
+
+    var tot = monthTotalHours(dates), expect = monthCapacityTotal(dates);
+    var proj = dates.reduce(function(a,d){
+      var wd = weekDayFor(d);
+      return a + (wd ? wd.week.rows.reduce(function(x,r){ return x + (PROJECTS[r.p].proj ? (r.h[wd.day]||0) : 0); }, 0) : 0);
+    }, 0);
+    $("kTot").innerHTML = fmt(tot) + "<small> / " + fmt(expect) + " h</small>";
+    var pct = expect ? Math.min(100, tot/expect*100) : 0;
+    var bar = $("kBar");
+    bar.style.width = pct + "%";
+    bar.className = tot >= expect ? "ok" : (pct < 80 ? "low" : "");
+    $("kProj").innerHTML = fmt(proj) + "<small> h</small>";
+    $("kProjBar").style.width = (tot ? proj/tot*100 : 0) + "%";
+
+    var absW = 0, zeros = 0;
+    dates.forEach(function(d){
+      var wd = weekDayFor(d);
+      if(!wd || wd.day > 4) return;
+      absW += absHoursOf(wd.week, wd.day);
+      if(capacityOf(wd.week, wd.day) > 0 && dayTotalOf(wd.week, wd.day) === 0) zeros++;
+    });
+    if($("kExtra")) $("kExtra").textContent = t("kextra_month_prefix", {weeks: plural(weeks.length, "n_weeks")}) + " · "
+      + t("kextra_absences", {h: fmt(absW)}) + " · " + plural(zeros, "n_empty_days");
+
+    var errs = monthErrors(dates).length;
+    $("kVal").textContent = errs ? plural(errs, "n_errors") : t("val_no_errors");
+    $("kVal").style.color = errs ? "var(--crit)" : "var(--good)";
+    var allSubmitted = weeks.every(function(w){ return w.submitted; });
+    $("submitBtn").disabled = allSubmitted || errs > 0 || tot === 0;
+    $("submitBtn").textContent = allSubmitted ? t("btn_month_submitted") : t("btn_submit_month");
+    /* Always visible on My Timesheet, not just while there's something
+       unsaved - the person can reach for it any time as reassurance,
+       not only when the app is telling them they have to. */
+    if($("saveBtn")) $("saveBtn").hidden = false;
+    syncBottomSaveSubmit();
+    var chip = $("stateChip");
+    chip.textContent = state.needsSave ? t("chip_save_to_finish") : (allSubmitted ? t("chip_in_approval") : t("state_draft"));
+    chip.className = state.needsSave ? "chip amber" : (allSubmitted ? "chip blue" : "chip grey");
+    chip.title = state.needsSave ? t("tip_save_to_finish") : "";
+    var sc = $("sugChip"), nv = visibleSugs().length;
+    sc.hidden = state.privateMode || nv === 0;
+    sc.textContent = plural(nv, "n_suggestions_review");
+    var pf = profileFor(WORKDATES[0]);
+    var pc = $("profChip");
+    if(pc){
+      pc.textContent = pf.code;
+      pc.title = companyName(IT0001.bukrs) + " · " + pf.fields;
+      pc.className = pf.clock ? "chip blue" : "chip grey";
+    }
+    var co = $("coSel");
+    if(co && co.value !== IT0001.bukrs) co.value = IT0001.bukrs;
+  }
+  function renderKpis(errCount){
+    if(isMonthly()) return renderKpisMonth();
+    $("weekLabel").textContent = weekLabelFor(WORKDATES, WEEKS[weekIdx].num);
+    $("prevW").disabled = weekIdx === 0;
+    $("nextW").disabled = weekIdx === WEEKS.length - 1;
+    /* the team screen has its own week navigator, kept in sync with this one */
+    if($("weekLabel2")) $("weekLabel2").textContent = weekLabelFor(WORKDATES, WEEKS[weekIdx].num);
+    var teamRange = teamWeekRange();
+    if($("prevW2")) $("prevW2").disabled = weekIdx <= teamRange.lo;
+    if($("nextW2")) $("nextW2").disabled = weekIdx >= teamRange.hi;
+    var tot = weekTotal(), proj = projTotal(), expect = weekCapacity();
+    $("kTot").innerHTML = fmt(tot) + "<small> / " + fmt(expect) + " h</small>";
+    var pct = expect ? Math.min(100, tot/expect*100) : 0;
+    var bar = $("kBar");
+    bar.style.width = pct + "%";
+    bar.className = tot >= expect ? "ok" : (pct < 80 ? "low" : "");
+    var absW = 0;
+    for(var a=0; a<5; a++) absW += absHours(a);
+    $("kProj").innerHTML = fmt(proj) + "<small> h</small>";
+    $("kProjBar").style.width = (tot ? proj/tot*100 : 0) + "%";
+    var zeros = 0;
+    for(var i=0; i<5; i++) if(capacity(i) > 0 && dayTotal(i) === 0) zeros++;
+    if($("kExtra")) $("kExtra").textContent = t("kextra_absences", {h: fmt(absW)}) + " · " + plural(zeros, "n_empty_days");
+    var errs = errCount;
+    $("kVal").textContent = errs ? plural(errs, "n_errors") : t("val_no_errors");
+    $("kVal").style.color = errs ? "var(--crit)" : "var(--good)";
+    $("submitBtn").disabled = state.submitted || errs > 0 || tot === 0;
+    $("submitBtn").textContent = state.submitted ? t("btn_week_submitted") : t("btn_submit_week");
+    /* Always visible on My Timesheet, not just while there's something
+       unsaved - see renderKpisMonth. */
+    if($("saveBtn")) $("saveBtn").hidden = false;
+    syncBottomSaveSubmit();
+    var chip = $("stateChip");
+    chip.textContent = state.needsSave ? t("chip_save_to_finish") : (state.submitted ? t("chip_in_approval") : t("state_draft"));
+    chip.className = state.needsSave ? "chip amber" : (state.submitted ? "chip blue" : "chip grey");
+    chip.title = state.needsSave ? t("tip_save_to_finish") : "";
+    var sc = $("sugChip"), nv = visibleSugs().length;
+    sc.hidden = state.privateMode || nv === 0;
+    sc.textContent = plural(nv, "n_suggestions_review");
+    var pf = profileFor(WORKDATES[0]);
+    var pc = $("profChip");
+    if(pc){
+      pc.textContent = pf.code;
+      pc.title = companyName(IT0001.bukrs) + " · " + pf.fields;
+      pc.className = pf.clock ? "chip blue" : "chip grey";
+    }
+    var co = $("coSel");
+    if(co && co.value !== IT0001.bukrs) co.value = IT0001.bukrs;
+  }
+
+  function render(){
+    applyMonthlyUI();
+    if(isMonthly()){ renderMonthGrid(); } else { renderGrid(); }
+    renderCal(); renderSugs(); renderAllow();
+    /* renderMsgs already runs validate() to build the message panel;
+       renderKpis only needs the error count from that same pass, so it's
+       passed through instead of validate() running a second time. Monthly
+       ignores it and computes its own (see renderKpisMonth): a submitted
+       week's errors still show in the month's message list but must not
+       count against whether the month can be submitted, so that count
+       can't be reused here. */
+    var errCount = renderMsgs(); renderKpis(errCount); renderApprovals(); renderTeam(); renderCats();
+  }
+
+  /* ---------- absences: a badge on the grid's day header, detail on hover ----------
+     Used to be a permanent side panel listing every absence, open or not.
+     The grid already marks which days are affected; hovering (or focusing,
+     for keyboard use) the badge is enough to see the full card, including
+     the pending ones' approval action, without reserving screen space for
+     it when nobody's looking. */
+  var absTipTimer = null;
+  function dayAbsBadge(a, label, extraClass){
+    var b = el("button","dayabs" + extraClass, label);
+    b.type = "button";
+    b.setAttribute("aria-label", a.type + ", " + DAYS[a.day] + ", " + absStatusLabel(a.status).toLowerCase());
+    b.onmouseenter = function(){ showAbsTip(a, b); };
+    b.onmouseleave = hideAbsTip;
+    b.onfocus = function(){ showAbsTip(a, b); };
+    b.onblur = hideAbsTip;
+    return b;
+  }
+  function showAbsTip(a, anchorEl){
+    clearTimeout(absTipTimer);
+    var tip = $("absTip");
+    if(!tip) return;
+    tip.innerHTML = "";
+    var c = el("div","abscard" + (a.status === "pending" ? " pend" : ""), "");
+    var h = el("div","h","");
+    h.appendChild(el("b","", a.type));
+    h.appendChild(el("span","chip " + (a.status === "approved" ? "grey" : "amber"), absStatusLabel(a.status)));
+    c.appendChild(h);
+    c.appendChild(el("div","why", DAYS[a.day] + " · " + fmt(a.hours) + " h · AWART " + a.awart));
+    c.appendChild(el("div","why", a.src + " · Leave Request, read-only"));
+    if(a.status === "pending"){
+      var acts = el("div","acts","");
+      acts.appendChild(btn(t("btn_simulate_approval"),"btn sm", function(){ hideAbsTipNow(); approveAbsence(a); }));
+      c.appendChild(acts);
+    }
+    tip.appendChild(c);
+    tip.hidden = false;
+    var r = anchorEl.getBoundingClientRect();
+    tip.style.left = Math.max(8, Math.min(r.left, window.innerWidth - 268)) + "px";
+    tip.style.top = (r.bottom + 6) + "px";
+    tip.onmouseenter = function(){ clearTimeout(absTipTimer); };
+    tip.onmouseleave = hideAbsTip;
+  }
+  function hideAbsTip(){ absTipTimer = setTimeout(hideAbsTipNow, 150); }
+  function hideAbsTipNow(){ clearTimeout(absTipTimer); var t = $("absTip"); if(t) t.hidden = true; }
+  function approveAbsence(a){
+    a.status = "approved";
+    var moved = dayTotal(a.day);
+    render();
+    if(moved > 0) toast(t("toast_absence_approved_conflict", {day: DAYS[a.day], h: fmt(moved)}), t("ui_resolve"), function(){ resolveConflict(a.day); });
+    else toast(t("toast_absence_approved_no_conflict", {day: DAYS[a.day]}));
+  }
+  function resolveConflict(day){
+    var target = -1;
+    for(var i=0; i<5; i++){ if(capacity(i) - dayTotal(i) > 0){ target = i; break; } }
+    var moved = 0;
+    state.rows.forEach(function(r){
+      if(!r.h[day]) return;
+      moved += r.h[day];
+      if(target > -1) r.h[target] += r.h[day];
+      r.h[day] = 0;
+    });
+    render();
+    toast(target > -1
+      ? t("toast_hours_moved", {h: fmt(moved), from: DAYS[day], to: DAYS[target]})
+      : t("toast_hours_removed_no_capacity", {h: fmt(moved), day: DAYS[day]}));
+  }
+
+  /* ---------- allowances, wage types against a project ----------
+     Quantity and unit, never a value, except the bonus, which the project
+     owner creates with an amount. An allowance can exist on a day with no
+     hours, so nothing here depends on the grid. */
+  var alEdit = null;
+  function myAllow(){
+    return state.allow.filter(function(a){ return (a.onBehalf || IT0001.pernr) === IT0001.pernr; });
+  }
+  function allowLabel(a){
+    var w = wt(a.code);
+    return w.amount ? fmt(a.amount) + " EUR" : fmt(a.qty) + " " + w.unit;
+  }
+  function renderAllow(){
+    var box = $("allowList");
+    if(!box) return;
+    box.innerHTML = "";
+    var mine = myAllow();
+    $("allowCount").textContent = plural(mine.length, "n_allowances");
+    /* Collapsed when there's nothing recorded, open when there is - unless
+       the person has already toggled it themselves this session, which
+       always wins over the automatic guess (see renderSugs). */
+    setPanelOpen("allowPanel", "allowTog", state.allowManualOpen === null ? mine.length > 0 : state.allowManualOpen);
+    if(!mine.length){
+      box.appendChild(el("div","paused",t("text_no_allowances_week")));
+      return;
+    }
+    mine.slice().sort(function(x,y){ return x.day - y.day; }).forEach(function(a){
+      var w = wt(a.code);
+      var c = el("div","abscard" + (w.amount ? " bonus" : ""), "");
+      var h = el("div","h","");
+      h.appendChild(el("b","", w.name));
+      h.appendChild(el("span","chip " + (w.amount ? "green" : "grey"), allowLabel(a)));
+      c.appendChild(h);
+      c.appendChild(el("div","why", DAYS[a.day] + " · " + PROJECTS[a.p].code + " · " + t("text_wage_type_label", {code: w.lgart})));
+      if(a.note) c.appendChild(el("div","why", a.note));
+      if(a.by !== a.onBehalf) c.appendChild(el("div","why", t("text_recorded_by_behalf", {name: a.byName})));
+      if(w.amount) c.appendChild(el("div","why", "Amount goes to CATSAMOUNT, native CATSDB field. ANZHL goes to CATS as 1."));
+      var acts = el("div","acts","");
+      var rm = btn(t("btn_remove"),"btn sm", function(){
+        if(!allowEditable(a)) return;
+        state.allow = state.allow.filter(function(x){ return x.id !== a.id; });
+        render(); toast(t("toast_allowance_removed", {name: w.name}), t("ui_undo"), function(){ state.allow.push(a); render(); });
+      });
+      rm.disabled = !allowEditable(a);
+      if(w.amount) rm.title = t("tip_bonus_remove_restricted");
+      acts.appendChild(rm);
+      c.appendChild(acts);
+      box.appendChild(c);
+    });
+  }
+  function allowEditable(a){
+    var w = wt(a.code);
+    if(state.submitted) return false;
+    if(!periodOpen(WORKDATES[a.day])) return false;
+    return !w.amount;
+  }
+  function openAllow(){
+    if(state.submitted){ toast(t("toast_week_submitted_no_allow_change")); return; }
+    if(weekPeriodClosed()){ toast(t("toast_week_closed_period")); return; }
+    alEdit = {id:"al"+(nextId++), day:0, p:state.rows.length ? state.rows[0].p : 0, code:wtFor()[0].code, qty:1, amount:0, note:"", by:IT0001.pernr, onBehalf:IT0001.pernr};
+    var sel = $("alCode");
+    sel.innerHTML = "";
+    wtFor().filter(function(w){ return w.selfEntry; }).forEach(function(w){
+      var o = document.createElement("option");
+      o.value = w.code; o.textContent = w.name + " (" + w.lgart + ")";
+      sel.appendChild(o);
+    });
+    alEdit.code = sel.value;
+    var pj = $("alProj");
+    pj.innerHTML = "";
+    PROJECTS.forEach(function(p,i){
+      var o = document.createElement("option");
+      o.value = String(i); o.textContent = p.code + " · " + p.name;
+      pj.appendChild(o);
+    });
+    pj.value = String(alEdit.p);
+    var dy = $("alDay");
+    dy.innerHTML = "";
+    DAYS.forEach(function(d,i){
+      var o = document.createElement("option");
+      o.value = String(i); o.textContent = d + (periodOpen(WORKDATES[i]) ? "" : " (period closed)");
+      o.disabled = !periodOpen(WORKDATES[i]);
+      dy.appendChild(o);
+    });
+    dy.value = "0";
+    syncAllowForm();
+    $("dlgAllow").showModal();
+  }
+  function syncAllowForm(){
+    var w = wt($("alCode").value);
+    $("alQty").value = "1";
+    $("alUnit").textContent = w.unit;
+    $("alNoteWrap").hidden = !w.noteLabel;
+    $("alNoteLbl").textContent = w.noteLabel || t("label_note");
+    $("alProjWrap").hidden = !w.needProj;
+    $("alHint").textContent = t("hint_allow_wage_type", {code: w.lgart, unit: w.unit});
+  }
+  function saveAllow(){
+    var w = wt($("alCode").value);
+    var qty = parseDur($("alQty").value);
+    if(isNaN(qty) || qty <= 0){ toast(t("toast_qty_must_be_positive")); return; }
+    state.allow.push({
+      id: alEdit.id,
+      day: +$("alDay").value,
+      p: w.needProj ? +$("alProj").value : 3,
+      code: w.code,
+      qty: qty,
+      amount: 0,
+      note: $("alNote").value.trim(),
+      by: IT0001.pernr,
+      onBehalf: IT0001.pernr,
+      byName: "self"
+    });
+    render();
+    toast(t("toast_allowance_recorded", {name: w.name, day: DAYS[+$("alDay").value]}));
+  }
+
+  /* ---------- CATS mapping screen ---------- */
+  var MAP = [
+    ["Employee recording the time","Personnel number","PERNR","cats",""],
+    ["Day column in the grid","Work date","WORKDATE","cats","One entry per day, never aggregated to the week"],
+    ["Cell value","Recorded hours","CATSHOURS","cats","Unit in UNIT, usually H"],
+    ["Start and end, profile Z_BSRV","Time window","BEGUZ, ENDUZ","cats","Standard CATSDB fields, shown or hidden by the data entry profile, never by the application"],
+    ["Company of the employee","Organizational assignment","IT0001, field BUKRS","cats","Decides the data entry profile through ZTIME_COMPANY_CFG, read at the date of the entry"],
+    ["Data entry profile in force","CATS profile","customizing, Z_CONS or Z_BSRV","cats","Z_CONS records duration only, Z_BSRV records start and end with the duration computed"],
+    ["Allowance recorded against a project","Wage type","LGART","cats","Has to exist in T512Z and be authorised in the profile"],
+    ["Allowance quantity","Number, with unit","ANZHL, ZEINH","cats","Days, kilometres. The bonus goes in with ANZHL 1"],
+    ["Bonus amount","Amount","CATSAMOUNT","cats","Native CATSDB field, CURR 13.2. Confirm with the client whether the standard CAT6 transfer maps it to IT2010 BETRG, or whether that needs configuring"],
+    ["Transfer to payroll","Standard transfer","CAT6 to IT2010","cats","No bespoke interface. CAT5 and CAT7 cover PS and CO"],
+    ["Recorded on behalf of someone","No equivalent","ON_BEHALF_OF","btp","Mass entry. The submitting user still lands in ERNAM, by standard behaviour"],
+    ["Period open or closed","No equivalent","ZTIME_PERIOD_CTRL","btp","Monthly, per company. Reopening is an HR action and is recorded"],
+    ["Project and WBS of the row","Receiver WBS element","RPROJ","cats","Field with conversion, the interface shows the external mask"],
+    ["Order, when the receiver is an order","Receiver order","RAUFNR","cats","Maintenance, CAPEX or internal orders"],
+    ["Network and operation","Network and operation","RNPLNR, RAUFPL, RAPLZL","cats","Only with network planning"],
+    ["Activity type","CO activity type","LSTAR","cats","The valuation key"],
+    ["Employee's cost center","Sender cost center","SKOSTL","cats","From master data, never manual"],
+    ["Receiver cost center","Receiver cost center","RKOSTL","cats","Internal entries without a project"],
+    ["Entry description","Short text","LTXA1","cats","40 characters. The interface accepts 300 and truncates"],
+    ["Absences in the calendar and the grid","Absence or attendance type","AWART","cats","Read from the Leave Request, read-only. The record stays in Time Management"],
+    ["Day blocking from an absence","Employee's daily capacity","work schedule and infotype 2001","cats","An approved full day closes the day, a half day reduces capacity"],
+    ["Pending leave request","Request in approval","Leave Request workflow","cats","Doesn't block, raises a warning. If approved, that day's hours conflict"],
+    ["Entries created by the assistant","No equivalent","ZZORIGIN with value Joule","btp","Same validations as manual entries, flagged for audit"],
+    ["Week status","Processing status","STATUS","cats","Confirm the domain values with the client"],
+    ["Approver and date","Approval","APNAM, APDAT","cats","Filled by the process, never by the interface"],
+    ["Correction after submission","Reference to the changed record","REFCOUNTER","cats","The change creates a new record, history stays"],
+    ["Entry origin","No equivalent","ZZORIGIN","btp","Manual, suggested, copied, on behalf of. Used for telemetry"],
+    ["Suggestion confidence level","No equivalent","none","btp","Never leaves the experience layer"],
+    ["Signal timeline","No equivalent","none","btp","14-day retention, personal data"],
+    ["Favorites and copy week","CATS worklist","worklist tables","cats","Prefer the standard worklist over a parallel list"],
+    ["Deviation justification","No equivalent","none","btp","Stays in the history, visible to the approver"]
+  ];
+  var WHERE = {cats:["CATS","cats"], btp:["BTP","btp"], ci:["CI_CATSDB","ci"]};
+
+  function renderMap(){
+    var b = $("mapBody");
+    if(!b || b.childElementCount) return;
+    MAP.forEach(function(m){
+      var tr = document.createElement("tr");
+      tr.appendChild(td2(m[0]));
+      var c2 = document.createElement("td");
+      c2.innerHTML = m[1] + (m[4] ? "<div class='sub' style='color:var(--ink-3); font-size:var(--fs-sm)'>"+m[4]+"</div>" : "");
+      tr.appendChild(c2);
+      var c3 = document.createElement("td");
+      c3.className = "f" + (m[2] === "none" ? " none" : "");
+      c3.textContent = m[2];
+      tr.appendChild(c3);
+      var c4 = document.createElement("td");
+      c4.innerHTML = "<span class='tag "+WHERE[m[3]][1]+"'>"+WHERE[m[3]][0]+"</span>";
+      tr.appendChild(c4);
+      b.appendChild(tr);
+    });
+  }
+
+  function catsRecords(){
+    var recs = [];
+    var status = state.submitted ? "20" : "10";
+    var clock = isClock();
+    state.rows.forEach(function(r){
+      var pr = PROJECTS[r.p];
+      r.h.forEach(function(v,i){
+        if(!v) return;
+        var s = clock ? slot(r,i) : null;
+        recs.push({
+          PERNR: PERNR,
+          WORKDATE: WORKDATES[i],
+          CATSHOURS: fmt(v),
+          UNIT: "H",
+          BEGUZ: s && s.b !== null ? fmtClock(s.b) : "",
+          ENDUZ: s && s.e !== null ? fmtClock(s.e) : "",
+          LGART: "",
+          ANZHL: "",
+          CATSAMOUNT: "",
+          LSTAR: pr.sap.lstar,
+          RPROJ: pr.sap.rproj || "",
+          SKOSTL: pr.sap.skostl,
+          RKOSTL: pr.sap.rkostl || "",
+          LTXA1: (r.desc || pr.act).slice(0,40),
+          STATUS: status
+        });
+      });
+    });
+    /* Allowances are CATS records too, with a wage type instead of hours. */
+    state.allow.forEach(function(a){
+      var w = wt(a.code), pr = PROJECTS[a.p];
+      recs.push({
+        PERNR: a.onBehalf || PERNR,
+        WORKDATE: WORKDATES[a.day],
+        CATSHOURS: "",
+        UNIT: w.amount ? "" : w.unit.toUpperCase().slice(0,3),
+        BEGUZ: "",
+        ENDUZ: "",
+        LGART: w.lgart,
+        ANZHL: w.amount ? "1.0" : fmt(a.qty),
+        CATSAMOUNT: w.amount ? fmt(a.amount) : "",
+        LSTAR: pr.sap.lstar,
+        RPROJ: pr.sap.rproj || "",
+        SKOSTL: pr.sap.skostl,
+        RKOSTL: pr.sap.rkostl || "",
+        LTXA1: (a.note || w.name).slice(0,40),
+        STATUS: status
+      });
+    });
+    return recs;
+  }
+
+  function renderCats(){
+    renderMap();
+    var body = $("catsBody");
+    if(!body) return;
+    var recs = catsRecords();
+    body.innerHTML = "";
+    recs.forEach(function(rec){
+      var tr = document.createElement("tr");
+      ["PERNR","WORKDATE","CATSHOURS","BEGUZ","ENDUZ","LGART","ANZHL","CATSAMOUNT","LSTAR","RPROJ","LTXA1","STATUS"].forEach(function(k){
+        var td = td2(rec[k] || "–");
+        if(k !== "LTXA1") td.className = "f";
+        if(k === "LGART" && rec[k]) td.className = "f wt";
+        tr.appendChild(td);
+      });
+      body.appendChild(tr);
+    });
+    if(!recs.length){
+      var tr = document.createElement("tr");
+      var td = document.createElement("td");
+      td.colSpan = 12; td.style.color = "var(--ink-3)";
+      td.textContent = t("text_no_records_to_generate");
+      tr.appendChild(td); body.appendChild(tr);
+    }
+    $("catsCount").textContent = plural(recs.length, "n_records_generated");
+    $("catsPayload").textContent =
+      "// Integration with CATS is BAPI only: BAPI_CATIMESHEETMGR_INSERT / _CHANGE / _DELETE,\n" +
+      "// with BAPI_TRANSACTION_COMMIT. No OData service, no WorkforceTimesheetService,\n" +
+      "// whether the target is cloud or on-premise\n\n" +
+      JSON.stringify({
+        requestId: "ts-2026-W" + WEEKS[weekIdx].num + "-" + PERNR,
+        bukrs: IT0001.bukrs,
+        profile: profileFor(WORKDATES[0]).code,
+        period: {ym: periodFor(WORKDATES[0]).ym, open: periodOpen(WORKDATES[0])},
+        release: state.submitted,
+        deviationJustification: state.deviationNote || null,
+        records: recs,
+        note: "CATSAMOUNT is a native CATSDB field (CURR 13,2), used above for the bonus. Confirm with the client whether the standard CAT6 transfer already maps it to IT2010 BETRG, or whether that mapping needs configuring, and which field carries the currency key alongside it",
+        btpOnly: {
+          comment: "stays in the experience layer, never enters CATSDB",
+          onBehalfOf: massLogThisWeek().slice(-8).map(function(e){
+            return {pernr: e.pernr, workdate: e.date, createdBy: e.createdBy, onBehalfOf: e.onBehalf};
+          }),
+          origins: state.rows.filter(function(r){ return rowTotal(r) > 0; }).map(function(r){
+            return {rproj: PROJECTS[r.p].sap.rproj || PROJECTS[r.p].sap.rkostl, origin: r.origin};
+          }),
+          absenceCapacity: (function(){
+            var o = {};
+            for(var i=0; i<5; i++) o[WORKDATES[i]] = fmt(capacity(i)) + " h";
+            return o;
+          })()
+        }
+      }, null, 2);
+  }
+
+
+  /* ---------- team screen, mass entry ----------
+     The leader fills a grid of people by days, reviews it, and saves. The save
+     is partial on purpose: rows that fail validation stay on screen with their
+     reason, the rest are written. Cancelling ten rows because of one approved
+     absence is the fastest way to make people stop using this screen. */
+  function stagedOf(pernr){
+    if(!state.staged[pernr]) state.staged[pernr] = {sel:false, h:[0,0,0,0,0,0,0], t:[null,null,null,null,null,null,null], err:""};
+    if(!state.staged[pernr].t) state.staged[pernr].t = [null,null,null,null,null,null,null];
+    return state.staged[pernr];
+  }
+  function memberBlocked(m, day){ return !!m.abs[day]; }
+  /* Most of the roster is a standard 8h/day schedule; a few named people
+     carry their own reduced dailyHours (see TEAM above), the same idea as
+     My week's own daily cap, just per person instead of a single value. */
+  function teamDailyCap(m){ return m.dailyHours || DAYCAP; }
+  function massProject(){ return +($("mProj") ? $("mProj").value : 0); }
+
+  /* ---------- already recorded, read-only ----------
+     A second grid, next to the editable one: what each person already has
+     this week, so the leader can see day load before staging more, rather
+     than piecing it together from the log on the right. Combines the sample
+     "already" hours with whatever is staged but not yet saved, so it updates
+     live as the leader fills the grid below. */
+  function renderAlreadyGrid(members){
+    var wrap = $("alreadyGrid");
+    if(!wrap) return;
+    wrap.innerHTML = "";
+    wrap.className = "tsgrid team readonly";
+
+    var head = document.createElement("div");
+    head.className = "row head";
+    head.appendChild(el("div","",t("th_employee")));
+    DAYS.forEach(function(d,i){ var c = el("div", dayExtraClass(i).trim(), ""); appendDayLabel(c, i); head.appendChild(c); });
+    head.appendChild(el("div","",t("th_total")));
+    head.appendChild(el("div","",""));
+    wrap.appendChild(head);
+
+    members.forEach(function(m){
+      var st = stagedOf(m.pernr);
+      var already = alreadyHoursFor(m, WEEKS[weekIdx].num);
+      /* Recorded on this person's behalf since the last header Save (see
+         teamSavedThrough) - a mass fill that goes straight to massLog,
+         like the assistant's team fill, never sits in state.staged, so
+         that alone would miss it entirely. */
+      var pendingHours = {};
+      state.massLog.slice(state.teamSavedThrough).forEach(function(e){
+        if(e.kind !== "hours" || e.pernr !== m.pernr) return;
+        var idx = WORKDATES.indexOf(e.date);
+        if(idx !== -1) pendingHours[idx] = (pendingHours[idx] || 0) + e.hours;
+      });
+      var row = document.createElement("div");
+      row.className = "row";
+      row.appendChild(el("div","rowmeta", m.name));
+      var rowTotal = 0;
+      already.forEach(function(v,i){
+        var total = v + (st.h[i] || 0);
+        rowTotal += total;
+        var cls = "already-cell" + dayExtraClass(i);
+        if(total > 8) cls += " over";
+        else if(total >= 8) cls += " full";
+        if(memberBlocked(m,i)) cls += " abs";
+        /* A visible marker, not just the tooltip below - so "what did the
+           assistant/mass entry just add here" doesn't require hovering
+           every cell one by one. Either still staged, or recorded but
+           not yet through the header Save. */
+        var stagedNow = st.h[i] || 0;
+        var pendingNow = pendingHours[i] || 0;
+        if(stagedNow || pendingNow) cls += " staged";
+        var cell = el("div", cls, total ? fmt(total) : "–");
+        if(memberBlocked(m,i)) cell.title = t("tip_approved_type", {type: m.abs[i].toLowerCase()});
+        else if(stagedNow && pendingNow) cell.title = fmt(v - pendingNow) + " h already · " + fmt(pendingNow) + " h recorded, " + fmt(stagedNow) + " h staged - Save to finish";
+        else if(pendingNow) cell.title = fmt(v - pendingNow) + " h already · " + fmt(pendingNow) + " h recorded, not yet saved";
+        else if(stagedNow) cell.title = fmt(v) + " h already · " + fmt(stagedNow) + " h staged now";
+        row.appendChild(cell);
+      });
+      row.appendChild(el("div","rowtot", rowTotal ? fmt(rowTotal) : "–"));
+      row.appendChild(el("div","",""));
+      wrap.appendChild(row);
+    });
+  }
+
+  /* One or more allowance lines for a single person/day cell, collapsed to
+     what fits a grid cell (total quantity, or a count when the lines don't
+     share a unit) with the full breakdown left for the title tooltip. Used
+     both for what's staged and for what's already saved, so the two grids
+     read the same way. */
+  function fmtAllowCell(lines){
+    if(!lines.length) return {text:"–", title:""};
+    var qty = lines.reduce(function(a,l){ return a + l.qty; }, 0);
+    var text = fmt(qty) + " " + (lines.length === 1 ? wt(lines[0].code).unit : "×" + lines.length);
+    var title = lines.map(function(l){
+      return wt(l.code).name + ": " + fmt(l.qty) + " " + wt(l.code).unit + " · " + PROJECTS[l.p].code + (l.note ? " (" + l.note + ")" : "");
+    }).join(", ");
+    return {text:text, title:title};
+  }
+
+  /* Same layout as renderAlreadyGrid (hours), so the leader reads both the
+     same way: a day-by-day grid instead of a flat card list. A cell can
+     still hide detail when a person has more than one wage type the same
+     day, that's what the tooltip is for. */
+  function renderAlreadyAllowGrid(members){
+    var wrap = $("alreadyAllowGrid");
+    if(!wrap) return;
+    wrap.innerHTML = "";
+    wrap.className = "tsgrid team readonly";
+
+    var head = document.createElement("div");
+    head.className = "row head";
+    head.appendChild(el("div","",t("th_employee")));
+    DAYS.forEach(function(d,i){ var c = el("div", dayExtraClass(i).trim(), ""); appendDayLabel(c, i); head.appendChild(c); });
+    head.appendChild(el("div","",t("th_total")));
+    head.appendChild(el("div","",""));
+    wrap.appendChild(head);
+
+    members.forEach(function(m){
+      var entries = state.massLog.filter(function(e){
+        return e.kind === "allowance" && e.pernr === m.pernr && WORKDATES.indexOf(e.date) !== -1;
+      });
+      var row = document.createElement("div");
+      row.className = "row";
+      row.appendChild(el("div","rowmeta", m.name));
+      var units = {};
+      DAYS.forEach(function(d,i){
+        var lines = entries.filter(function(e){ return e.day === i; });
+        var info = fmtAllowCell(lines);
+        var cls = "already-cell" + dayExtraClass(i) + (memberBlocked(m,i) ? " abs" : "");
+        var cell = el("div", cls, info.text);
+        if(memberBlocked(m,i)) cell.title = t("tip_approved_type", {type: m.abs[i].toLowerCase()});
+        else if(lines.length) cell.title = info.title;
+        if(lines.length){
+          lines.forEach(function(l){ units[wt(l.code).unit] = (units[wt(l.code).unit]||0) + l.qty; });
+        }
+        row.appendChild(cell);
+      });
+      var unitKeys = Object.keys(units);
+      var totTxt = unitKeys.length === 0 ? "–" : (unitKeys.length === 1 ? fmt(units[unitKeys[0]]) + " " + unitKeys[0] : entries.length + " lines");
+      row.appendChild(el("div","rowtot", totTxt));
+      row.appendChild(el("div","",""));
+      wrap.appendChild(row);
+    });
+  }
+
+  function renderTeam(){
+    var wrap = $("teamGrid");
+    if(!wrap) return;
+
+    /* project options, limited to the leader's scope. This has to run
+       before teamOf(), which reads #mProj's current value to decide who's
+       even on the roster now. */
+    var pj = $("mProj");
+    if(pj && !pj.dataset.for || (pj && pj.dataset.for !== state.leader)){
+      var keep = pj.value;
+      pj.innerHTML = "";
+      projectsOf(state.leader).forEach(function(i){
+        var o = document.createElement("option");
+        o.value = String(i); o.textContent = PROJECTS[i].code + " · " + PROJECTS[i].name;
+        pj.appendChild(o);
+      });
+      pj.dataset.for = state.leader;
+      if(keep && pj.querySelector('option[value="'+keep+'"]')) pj.value = keep;
+    }
+
+    var members = teamOf(state.leader);
+
+    $("teamCount").textContent = plural(members.length, "n_people");
+    var teamChip = $("teamStateChip");
+    if(teamChip){
+      teamChip.textContent = state.teamNeedsSave ? t("chip_save_to_finish") : t("chip_up_to_date");
+      teamChip.className = state.teamNeedsSave ? "chip amber" : "chip grey";
+    }
+
+    renderAlreadyGrid(members);
+    renderAlreadyAllowGrid(members);
+
+    wrap.innerHTML = "";
+    var anyClock = members.some(function(m){ return profileFor(WORKDATES[0], m.bukrs).clock; });
+    var anyDur = members.some(function(m){ return !profileFor(WORKDATES[0], m.bukrs).clock; });
+    wrap.className = "tsgrid team" + (anyClock ? " clock" : "");
+    /* Only show the fields this team can actually use: an all-Z_CONS team has
+       nothing to do with Start/End, an all-Z_BSRV team has nothing to do with
+       Duration. Both stayed visible regardless before, which read as broken
+       when neither field did anything for the team on screen. */
+    if($("mDurWrap")) $("mDurWrap").hidden = !anyDur;
+    if($("mBegWrap")) $("mBegWrap").hidden = !anyClock;
+    if($("mEndWrap")) $("mEndWrap").hidden = !anyClock;
+
+    var head = document.createElement("div");
+    head.className = "row head";
+    head.appendChild(el("div","",t("th_employee")));
+    DAYS.forEach(function(d,i){ var c = el("div", dayExtraClass(i).trim(), ""); appendDayLabel(c, i); head.appendChild(c); });
+    head.appendChild(el("div","",t("th_total")));
+    head.appendChild(el("div","",""));
+    wrap.appendChild(head);
+
+    members.forEach(function(m){
+      var st = stagedOf(m.pernr);
+      var row = document.createElement("div");
+      row.className = "row" + (m.locked ? " locked" : "");
+
+      var meta = el("div","rowmeta","");
+      var p = el("div","p","");
+      var cb = document.createElement("input");
+      cb.type = "checkbox";
+      cb.checked = st.sel;
+      cb.disabled = m.locked;
+      cb.setAttribute("aria-label",t("aria_select_name", {name: m.name}));
+      cb.onchange = function(){ st.sel = cb.checked; renderTeam(); };
+      p.appendChild(cb);
+      p.appendChild(el("span","", m.name));
+      var code = document.createElement("code"); code.textContent = m.pernr; p.appendChild(code);
+      meta.appendChild(p);
+      /* teamOf() only lists people allocated to the project selected above,
+         so everyone in this loop already qualifies - no need to spell out
+         which project(s), the roster itself is the answer. */
+      var sub = m.role + " · " + m.bukrs + " · " + profileFor(WORKDATES[0], m.bukrs).code;
+      if(m.dailyHours) sub += " · " + fmt(m.dailyHours) + "h/dia";
+      var absDays = Object.keys(m.abs).map(Number).sort(function(a,b){ return a-b; });
+      if(absDays.length){
+        sub += " · " + absDays.map(function(d){ return DAYS[d] + " " + m.abs[d].toLowerCase(); }).join(", ");
+      }
+      if(m.locked) sub += " · week already approved";
+      var s = el("div","s", sub);
+      if(m.locked) s.style.color = "var(--warn)";
+      meta.appendChild(s);
+      row.appendChild(meta);
+
+      st.h.forEach(function(v,i){
+        if(state.teamTab === "allow"){
+          /* The grid is shared across tabs so selection stays put, but on
+             Allowances it has nothing to do with hours: show what's staged
+             (not yet saved) for this person and day instead, so the leader
+             sees it land here, not only in the list below. */
+          var lines = state.stagedAllow.filter(function(a){ return a.pernr === m.pernr && a.day === i; });
+          var info = fmtAllowCell(lines);
+          var cell = el("div","allowcell" + dayExtraClass(i), info.text);
+          if(lines.length){
+            cell.title = info.title + " · staged, not saved";
+            cell.classList.add("pending");
+          }
+          row.appendChild(cell);
+          return;
+        }
+        var clock = profileFor(WORKDATES[i], m.bukrs).clock;
+        if(clock){
+          /* Z_BSRV is filled from the Start/End fields above, not per cell. An
+             unstaged cell is just empty, not a form field waiting for input:
+             the only place to fill it is Apply to selected. Once staged, the
+             leader sees exactly what was recorded, project included, without
+             waiting for the save log. */
+          var slotT = st.t[i];
+          if(!slotT){
+            var ph = el("div","cell computed" + dayExtraClass(i), "–");
+            ph.title = t("tip_clock_use_fields");
+            if(memberBlocked(m,i)){ ph.classList.add("abs"); ph.title = t("tip_approved_type", {type: m.abs[i].toLowerCase()}); }
+            if(!periodOpen(WORKDATES[i], m.bukrs)){ ph.classList.add("closed"); ph.title = t("tip_closed_period_short"); }
+            row.appendChild(ph);
+            return;
+          }
+          var box = el("div","clockcell" + dayExtraClass(i), "");
+          ["b","e"].forEach(function(k){
+            var tinp = document.createElement("input");
+            tinp.type = "text";
+            tinp.className = "tinp";
+            tinp.value = fmtClock(slotT[k]);
+            tinp.disabled = true;
+            tinp.setAttribute("aria-label", t(k === "b" ? "aria_start_time_for" : "aria_end_time_for", {name: m.name, day: DAYS[i]}));
+            box.appendChild(tinp);
+          });
+          box.appendChild(el("div","cdur", v ? fmt(v) + " h" : "–"));
+          box.title = PROJECTS[massProject()].code + " · " + fmtClock(slotT.b) + "–" + fmtClock(slotT.e);
+          if(memberBlocked(m,i)){ box.classList.add("abs"); box.title = t("tip_approved_type", {type: m.abs[i].toLowerCase()}); }
+          if(!periodOpen(WORKDATES[i], m.bukrs)){ box.classList.add("closed"); box.title = t("tip_closed_period_short"); }
+          row.appendChild(box);
+          return;
+        }
+        var inp = document.createElement("input");
+        inp.type = "text";
+        inp.className = "cell" + dayExtraClass(i);
+        inp.value = v ? fmt(v) : "";
+        inp.inputMode = "decimal";
+        inp.disabled = m.locked || memberBlocked(m,i) || !periodOpen(WORKDATES[i], m.bukrs);
+        inp.title = v ? (PROJECTS[massProject()].code + " · " + fmt(v) + " h") : "";
+        inp.setAttribute("aria-label","Hours for "+m.name+", "+DAYS[i]);
+        if(memberBlocked(m,i)){ inp.classList.add("abs"); inp.title = "Approved "+m.abs[i].toLowerCase(); }
+        if(!periodOpen(WORKDATES[i], m.bukrs)){ inp.classList.add("closed"); inp.title = "Closed period"; }
+        inp.addEventListener("change", function(){
+          var parsed = parseDur(inp.value);
+          if(isNaN(parsed)){ toast(t("toast_bad_number", {v: inp.value})); renderTeam(); return; }
+          var newVal = round15(parsed);
+          /* Same rule as My week: never let a day go over the person's own
+             daily capacity, counting what they already have recorded that
+             day (alreadyHoursFor), not just what's being staged here. */
+          var already = alreadyHoursFor(m, WEEKS[weekIdx].num)[i];
+          var cap = teamDailyCap(m);
+          if(already + newVal > cap){
+            var left = Math.max(0, cap - already);
+            toast(t("toast_capacity_on_day", {name: m.name, cap: fmt(cap), day: DAYS[i]}) + (left > 0 ? t("toast_only_available", {left: fmt(left)}) : t("toast_no_hours_available")));
+            renderTeam();
+            return;
+          }
+          st.h[i] = newVal;
+          st.t[i] = null;
+          renderTeam();
+        });
+        row.appendChild(inp);
+      });
+
+      if(state.teamTab === "allow"){
+        var mLines = state.stagedAllow.filter(function(a){ return a.pernr === m.pernr; });
+        var totTxt = "–";
+        if(mLines.length){
+          var units = {};
+          mLines.forEach(function(l){ var u = wt(l.code).unit; units[u] = (units[u]||0) + l.qty; });
+          var unitKeys = Object.keys(units);
+          totTxt = unitKeys.length === 1 ? fmt(units[unitKeys[0]]) + " " + unitKeys[0] : mLines.length + " staged";
+        }
+        row.appendChild(el("div","rowtot", totTxt));
+      } else {
+        var tot = st.h.reduce(function(a,b){ return a+(b||0); },0);
+        row.appendChild(el("div","rowtot", tot ? fmt(tot) : "–"));
+      }
+      var act = el("div","rowact","");
+      if(st.err){
+        var flag = el("span","errdot","!");
+        flag.title = st.err;
+        act.appendChild(flag);
+      }
+      row.appendChild(act);
+      wrap.appendChild(row);
+    });
+
+    var sel = members.filter(function(m){ return stagedOf(m.pernr).sel; }).length;
+    var staged = members.reduce(function(a,m){ return a + stagedOf(m.pernr).h.reduce(function(x,y){ return x+(y||0); },0); },0);
+    $("mSel").textContent = plural(sel, "n_selected");
+    if(state.teamTab === "allow"){
+      var n = state.stagedAllow.length;
+      $("mStaged").innerHTML = n + "<small> " + plural(n, "lines_staged_suffix") + "</small>";
+    } else {
+      $("mStaged").innerHTML = fmt(staged) + "<small> " + t("h_staged_suffix") + "</small>";
+    }
+    $("mSave").disabled = staged === 0;
+
+    renderMassLog();
+    renderBonusPanel();
+    renderMassAllowList();
+    setTeamTab(state.teamTab);
+  }
+
+  /* Fills duration for people on a duration profile, and start/end for people
+     on Z_BSRV, in the same click. A mixed selection (Carlos Pinto's team has
+     both) uses whichever field applies to each person; a cell whose profile
+     needs the field left blank is skipped, not guessed. */
+  function applyMass(){
+    var members = teamOf(state.leader).filter(function(m){ return stagedOf(m.pernr).sel && !m.locked; });
+    if(!members.length){ toast(t("toast_select_person_first")); return; }
+    var dur = parseDur($("mDur").value);
+    var hasDur = !isNaN(dur) && dur > 0;
+    var bTxt = $("mBeg") ? $("mBeg").value : "", eTxt = $("mEnd") ? $("mEnd").value : "";
+    var b = parseClock(bTxt), e = parseClock(eTxt);
+    var hasClock = bTxt.trim() !== "" && eTxt.trim() !== "" && !isNaN(b) && !isNaN(e);
+    if(!hasDur && !hasClock){ toast(t("toast_give_duration_or_clock")); return; }
+    var days = [];
+    Array.prototype.forEach.call(document.querySelectorAll(".mHoursDays input:checked"), function(c){ days.push(+c.value); });
+    if(!days.length){ toast(t("toast_pick_a_day")); return; }
+    var touched = 0, skipped = 0, capped = 0;
+    members.forEach(function(m){
+      var st = stagedOf(m.pernr);
+      var already = alreadyHoursFor(m, WEEKS[weekIdx].num);
+      var cap = teamDailyCap(m);
+      days.forEach(function(d){
+        if(memberBlocked(m,d) || !periodOpen(WORKDATES[d], m.bukrs)) return;
+        var clock = profileFor(WORKDATES[d], m.bukrs).clock;
+        var val;
+        if(clock){
+          if(!hasClock){ skipped++; return; }
+          val = slotHours({b:b, e:e});
+        } else {
+          if(!hasDur){ skipped++; return; }
+          val = round15(dur);
+        }
+        /* Same daily cap as a single manual cell (durCell, the Team hours
+           input above): bulk-filling never gets to skip the check just
+           because it touches many people at once. */
+        if(already[d] + val > cap){ capped++; return; }
+        if(clock){ st.t[d] = {b:b, e:e}; st.h[d] = val; }
+        else { st.t[d] = null; st.h[d] = val; }
+        touched++;
+      });
+    });
+    renderTeam();
+    var msg = t("toast_cells_filled", {n: touched, people: members.length});
+    if(skipped) msg += plural(skipped, "cells_skipped_field");
+    if(capped) msg += plural(capped, "cells_skipped_capacity");
+    toast(msg);
+  }
+
+  function clearMass(){
+    Object.keys(state.staged).forEach(function(k){ state.staged[k] = {sel:false, h:[0,0,0,0,0,0,0], t:[null,null,null,null,null,null,null], err:""}; });
+    state.stagedAllow = [];
+    renderTeam();
+  }
+
+  /* Partial save. Every row is validated on its own and the ones that pass are
+     written, with CREATED_BY as the leader and ON_BEHALF_OF as the employee. */
+  /* onlyPernrs, when given, restricts the commit to those people, leaving
+     anyone else's staged-but-unsaved hours exactly as they were: without
+     it, this saves every nonzero staged line for the whole team, which is
+     what "Save staged entries" on screen means (several people can be
+     staged in separate batches before one Save). The chat assistant passes
+     it, scoped to whoever its own confirmation card named, so a person's
+     unrelated staged hours from an earlier, still-unconfirmed manual batch
+     never get swept into a save the person never saw or confirmed. */
+  function saveMass(onlyPernrs, silent){
+    var leader = leaderById(state.leader);
+    var members = teamOf(state.leader);
+    if(onlyPernrs) members = members.filter(function(m){ return onlyPernrs.indexOf(m.pernr) !== -1; });
+    var saved = 0, kept = 0, savedPeople = 0;
+    var pIdx = massProject();
+    members.forEach(function(m){
+      var st = stagedOf(m.pernr);
+      var total = st.h.reduce(function(a,b){ return a+(b||0); },0);
+      if(total === 0){ st.err = ""; return; }
+      var err = "";
+      if(m.locked) err = "Week already approved, the line was left untouched.";
+      else if(!isEligibleForProject(m, pIdx)) err = m.name.split(" ")[0] + " is not allocated to " + PROJECTS[pIdx].code + ".";
+      else {
+        var already = alreadyHoursFor(m, WEEKS[weekIdx].num);
+        var cap = teamDailyCap(m);
+        for(var d=0; d<7; d++){
+          if(!st.h[d]) continue;
+          if(memberBlocked(m,d)){ err = DAYS[d] + " has an approved " + m.abs[d].toLowerCase() + "."; break; }
+          if(!periodOpen(WORKDATES[d], m.bukrs)){ err = DAYS[d] + " falls in a closed period."; break; }
+          if(st.h[d] > 24){ err = DAYS[d] + " is above 24 hours."; break; }
+          /* The authoritative capacity gate: every path that stages hours
+             (a manual cell, Apply to selected, or the chat assistant) ends
+             up here before anything is actually saved, so this is the one
+             place that has to catch all of them, not just the UI paths
+             that already guard themselves on the way in. */
+          if(already[d] + st.h[d] > cap){
+            err = DAYS[d] + "'s capacity is " + fmt(cap) + " h for " + m.name.split(" ")[0] + "."; break;
+          }
+          if(profileFor(WORKDATES[d], m.bukrs).clock && (!st.t[d] || st.t[d].b === null || st.t[d].e === null)){
+            err = DAYS[d] + " needs both a start and an end for " + m.name.split(" ")[0] + "."; break;
+          }
+        }
+      }
+      if(err){ st.err = err; kept++; return; }
+      st.err = "";
+      for(var i=0; i<7; i++){
+        if(!st.h[i]) continue;
+        state.massLog.push({
+          kind: "hours",
+          pernr: m.pernr, name: m.name, date: WORKDATES[i], day: i, hours: st.h[i],
+          p: pIdx, createdBy: leader.name, onBehalf: m.pernr,
+          profile: profileFor(WORKDATES[i], m.bukrs).code,
+          beg: st.t[i] ? st.t[i].b : null, end: st.t[i] ? st.t[i].e : null
+        });
+        saved++;
+      }
+      savedPeople++;
+      state.staged[m.pernr] = {sel:false, h:[0,0,0,0,0,0,0], t:[null,null,null,null,null,null,null], err:""};
+    });
+    /* Recorded on behalf, but not yet persisted - same distinction as
+       Submit vs Save on My Timesheet. The header Save button is what
+       actually reflects this in the database. */
+    if(saved) state.teamNeedsSave = true;
+    renderTeam();
+    if(silent) return saved;
+    var who = savedPeople + (savedPeople === 1 ? " person" : " people");
+    var left = kept + (kept === 1 ? " line stayed" : " lines stayed");
+    if(saved && kept) toast(t("toast_team_entries_partial", {saved: saved, who: who, left: left}));
+    else if(saved) toast(t("toast_team_entries_all", {saved: saved, who: who}));
+    else toast(t("toast_team_entries_none"));
+    return saved;
+  }
+
+  /* ---------- allowances, mass entry ----------
+     Same partial, staged-then-saved pattern as hours, but the line items are
+     flat (an allowance is one occurrence, not a per-day grid cell), so
+     they're staged in a list instead of a second grid. The bonus wage type
+     never appears here, it stays the project owner's separate panel. */
+  function massWageTypes(){
+    /* the team can mix companies (Carlos Pinto has PT01 and PT02 people), so
+       the shift allowance is offered if anyone on the team could use it, not
+       just whoever happens to be first in the list */
+    var anyShiftCompany = teamOf(state.leader).some(function(m){ return m.bukrs === "PT02"; });
+    return WAGETYPES.filter(function(w){ return w.selfEntry && (w.code !== "TURNO" || anyShiftCompany); });
+  }
+  function syncMassAllowForm(){
+    var sel = $("mAllowCode");
+    if(!sel) return;
+    var w = wt(sel.value);
+    if(!w) return;
+    $("mAllowUnit").textContent = w.unit;
+    $("mAllowNoteWrap").hidden = !w.noteLabel;
+    $("mAllowNoteLbl").textContent = w.noteLabel || t("label_note");
+  }
+  function applyMassAllow(){
+    var members = teamOf(state.leader).filter(function(m){ return stagedOf(m.pernr).sel && !m.locked; });
+    if(!members.length){ toast(t("toast_select_person_first")); return; }
+    var w = wt($("mAllowCode").value);
+    var qty = parseDur($("mAllowQty").value);
+    if(isNaN(qty) || qty <= 0){ toast(t("toast_give_qty_positive")); return; }
+    var note = $("mAllowNote").value.trim();
+    if(w.noteLabel && !note){ toast(t("toast_note_required_for", {note: w.noteLabel, name: w.name})); return; }
+    var days = [];
+    Array.prototype.forEach.call(document.querySelectorAll(".mAllowDays input:checked"), function(c){ days.push(+c.value); });
+    if(!days.length){ toast(t("toast_pick_a_day")); return; }
+    var pIdx = w.needProj ? massProject() : 3;
+    var added = 0, skippedCompany = 0, skippedProject = 0;
+    members.forEach(function(m){
+      if(w.code === "TURNO" && m.bukrs !== "PT02"){ skippedCompany++; return; }
+      /* A leader who owns more than one project can have a team member
+         selected who isn't actually allocated to the project currently
+         picked (they're on the team through the leader's other project):
+         skip them here too, same as Hours already does at save time. */
+      if(w.needProj && !isEligibleForProject(m, pIdx)){ skippedProject++; return; }
+      days.forEach(function(d){
+        if(!periodOpen(WORKDATES[d], m.bukrs)) return;
+        state.stagedAllow.push({pernr:m.pernr, name:m.name, code:w.code, day:d, p:pIdx, qty:round15(qty), note:note});
+        added++;
+      });
+    });
+    renderTeam();
+    var msg = plural(added, "allow_lines_staged", {people: members.length});
+    if(skippedCompany) msg += t("toast_allow_skipped_company", {n: skippedCompany});
+    if(skippedProject) msg += t("toast_allow_skipped_project", {n: skippedProject, code: PROJECTS[pIdx].code});
+    toast(msg);
+  }
+  function clearMassAllow(){
+    state.stagedAllow = [];
+    renderTeam();
+  }
+  /* Same onlyPernrs scoping as saveMass(): without it, every staged
+     allowance line is committed and cleared, which is what "Save staged
+     allowances" on screen means. The chat assistant passes it, scoped to
+     its own confirmation card, so someone else's still-unconfirmed staged
+     lines are left in place instead of being saved (or wiped) alongside it. */
+  function saveMassAllow(onlyPernrs, silent){
+    var lines = onlyPernrs
+      ? state.stagedAllow.filter(function(a){ return onlyPernrs.indexOf(a.pernr) !== -1; })
+      : state.stagedAllow;
+    if(!lines.length){ if(!silent) toast(t("toast_nothing_staged")); return 0; }
+    var leader = leaderById(state.leader);
+    lines.forEach(function(a){
+      state.massLog.push({
+        kind: "allowance",
+        pernr: a.pernr, name: a.name, date: WORKDATES[a.day], day: a.day,
+        code: a.code, qty: a.qty, note: a.note, p: a.p,
+        createdBy: leader.name, onBehalf: a.pernr
+      });
+    });
+    var n = lines.length;
+    state.stagedAllow = onlyPernrs
+      ? state.stagedAllow.filter(function(a){ return onlyPernrs.indexOf(a.pernr) === -1; })
+      : [];
+    state.teamNeedsSave = true;
+    renderTeam();
+    if(!silent) toast(plural(n, "allow_lines_recorded"));
+    return n;
+  }
+  /* The header's single Save button: records whatever is still staged
+     (silently, same rules and same partial-save behaviour as the Hours/
+     Allowances tabs' own buttons) and then, in the same click, clears
+     teamNeedsSave - the step that actually reflects everything already
+     recorded on behalf of the team in the database. One safe click that
+     always finishes the job, whichever tab it was staged from. */
+  function saveTeamAll(){
+    var hoursSaved = saveMass(null, true);
+    var allowSaved = saveMassAllow(null, true);
+    if(!hoursSaved && !allowSaved && !state.teamNeedsSave){
+      toast(t("toast_nothing_to_save"));
+      return;
+    }
+    state.teamNeedsSave = false;
+    state.teamSavedThrough = state.massLog.length;
+    renderTeam();
+    toast(t("toast_changes_saved"));
+  }
+  function renderMassAllowList(){
+    var box = $("mAllowList");
+    if(!box) return;
+    /* wage type options, limited to what this leader's team can record */
+    var sel = $("mAllowCode");
+    if(sel && sel.dataset.for !== state.leader){
+      var keep = sel.value;
+      sel.innerHTML = "";
+      massWageTypes().forEach(function(w){
+        var o = document.createElement("option");
+        o.value = w.code; o.textContent = w.name + " (" + w.lgart + ")";
+        sel.appendChild(o);
+      });
+      sel.dataset.for = state.leader;
+      if(keep && sel.querySelector('option[value="'+keep+'"]')) sel.value = keep;
+      syncMassAllowForm();
+    }
+    $("mAllowStagedCount").textContent = state.stagedAllow.length + (state.stagedAllow.length === 1 ? " staged" : " staged");
+    if($("mAllowProj")){
+      $("mAllowProj").textContent = PROJECTS[massProject()].code + " · " + PROJECTS[massProject()].name;
+    }
+    $("mAllowSave").disabled = state.stagedAllow.length === 0;
+    box.innerHTML = "";
+    if(!state.stagedAllow.length){
+      box.appendChild(el("div","paused",t("text_nothing_staged_yet")));
+      return;
+    }
+    state.stagedAllow.forEach(function(a){
+      var w = wt(a.code);
+      var c = el("div","abscard","");
+      var h = el("div","h","");
+      h.appendChild(el("b","", a.name));
+      h.appendChild(el("span","chip grey", fmt(a.qty) + " " + w.unit));
+      c.appendChild(h);
+      c.appendChild(el("div","why", DAYS[a.day] + " · " + PROJECTS[a.p].code + " · " + t("text_wage_type_label", {code: w.lgart})));
+      if(a.note) c.appendChild(el("div","why", a.note));
+      box.appendChild(c);
+    });
+  }
+
+  /* state.massLog holds every mass entry ever recorded, across every week,
+     not just this one - it's the CATS payload's audit trail too. Without
+     this filter, switching weeks left last week's entries on screen, and
+     DAYS[e.day] read them against the WRONG week's calendar, so "Tue 15"
+     silently relabelled itself "Tue 22" the moment the visible week
+     changed, still pointing at the same stored day-of-week offset. */
+  function massLogThisWeek(){
+    return state.massLog.filter(function(e){ return WORKDATES.indexOf(e.date) !== -1; });
+  }
+  function renderMassLog(){
+    var box = $("massLog");
+    if(!box) return;
+    box.innerHTML = "";
+    var weekLog = massLogThisWeek();
+    $("massLogCount").textContent = plural(weekLog.length, "n_entries");
+    if(!weekLog.length){
+      box.appendChild(el("div","paused",t("text_nothing_recorded_behalf_week")));
+      return;
+    }
+    weekLog.slice(-12).reverse().forEach(function(e){
+      var c = el("div","abscard","");
+      var h = el("div","h","");
+      h.appendChild(el("b","", e.name));
+      if(e.kind === "bonus"){
+        h.appendChild(el("span","chip green", fmt(e.amount) + " EUR"));
+        c.appendChild(h);
+        c.appendChild(el("div","why", DAYS[e.day] + " · " + PROJECTS[e.p].code + " · " + wt(e.code).name));
+        c.appendChild(el("div","why", e.note));
+      } else if(e.kind === "allowance"){
+        var w = wt(e.code);
+        h.appendChild(el("span","chip grey", fmt(e.qty) + " " + w.unit));
+        c.appendChild(h);
+        c.appendChild(el("div","why", DAYS[e.day] + " · " + PROJECTS[e.p].code + " · " + w.name));
+      } else {
+        h.appendChild(el("span","chip grey", fmt(e.hours) + " h"));
+        c.appendChild(h);
+        var line = DAYS[e.day] + " · " + PROJECTS[e.p].code + " · " + e.profile;
+        if(e.beg !== null && e.beg !== undefined) line += " · " + fmtClock(e.beg) + "–" + fmtClock(e.end);
+        c.appendChild(el("div","why", line));
+      }
+      c.appendChild(el("div","why", "CREATED_BY " + e.createdBy + " · ON_BEHALF_OF " + e.onBehalf));
+      box.appendChild(c);
+    });
+  }
+
+  /* ---------- bonus, created by the project owner ----------
+     The only allowance carrying an amount and the only one the employee does
+     not record. Defining the value and approving are the same act, by the same
+     person, so there is no separate approval step. Every leader in Team entry
+     is a project owner (scope is by project, never by line hierarchy), so the
+     panel is always available here. */
+  function renderBonusPanel(){
+    var panel = $("bonusPanel");
+    if(!panel) return;
+    var leader = leaderById(state.leader);
+    /* visibility is owned by setTeamTab() now, one of the three mass-entry
+       tabs, not this function — every leader is a project owner so the
+       tab itself is always enabled, just not always the active one.
+       Who it's for comes from the Team grid's own checkboxes, same as
+       Hours and Allowances, instead of a second, separate picker here. */
+    $("bProj").textContent = PROJECTS[massProject()].code + " · " + PROJECTS[massProject()].name;
+    var box = $("bonusList");
+    box.innerHTML = "";
+    var mine = state.allow.filter(function(a){ return wt(a.code).amount; });
+    if(!mine.length){ box.appendChild(el("div","paused",t("text_no_bonus_recorded"))); return; }
+    mine.forEach(function(a){
+      var c = el("div","abscard bonus","");
+      var h = el("div","h","");
+      h.appendChild(el("b","", a.forName || t("th_employee")));
+      h.appendChild(el("span","chip green", fmt(a.amount) + " EUR"));
+      c.appendChild(h);
+      c.appendChild(el("div","why", DAYS[a.day] + " · " + PROJECTS[a.p].code + " · " + t("text_wage_type_label", {code: wt(a.code).lgart})));
+      c.appendChild(el("div","why", a.note));
+      c.appendChild(el("div","why", "Defined and approved by " + a.byName + ", in the same act"));
+      box.appendChild(c);
+    });
+  }
+  function saveBonus(){
+    var leader = leaderById(state.leader);
+    var pIdx = massProject();
+    var members = teamOf(state.leader).filter(function(m){ return stagedOf(m.pernr).sel && !m.locked; });
+    if(!members.length){ toast(t("toast_select_person_first")); return; }
+    var amount = parseDur($("bAmount").value);
+    var note = $("bNote").value.trim();
+    if(isNaN(amount) || amount <= 0){ toast(t("toast_amount_must_be_positive")); return; }
+    if(!note){ toast(t("toast_bonus_reason_required")); return; }
+    /* A leader who owns more than one project can have someone selected who
+       isn't actually allocated to the project picked above (they're on the
+       team through the leader's other project): skip them, same partial-save
+       pattern as Hours and Allowances, rather than billing the wrong project. */
+    var eligible = members.filter(function(m){ return isEligibleForProject(m, pIdx); });
+    var ineligible = members.filter(function(m){ return !isEligibleForProject(m, pIdx); });
+    if(!eligible.length){ toast(t("toast_none_allocated", {code: PROJECTS[pIdx].code})); return; }
+    var recorded = [], noOpenDay = [];
+    eligible.forEach(function(who){
+      var day = -1;
+      for(var i=4; i>=0; i--){ if(periodOpen(WORKDATES[i], who.bukrs)){ day = i; break; } }
+      /* Every weekday closed is the same "nothing open to bill to" case
+         Hours and Allowances already skip with a reason, not a silent
+         write to whatever day the loop happened to start from. */
+      if(day === -1){ noOpenDay.push(who); return; }
+      state.allow.push({
+        id:"al"+(nextId++), day:day, p:pIdx, code:"BONUS", qty:1, amount:amount,
+        note:note, by:leader.id, onBehalf:who.pernr, byName:leader.name, forName:who.name
+      });
+      state.massLog.push({
+        kind:"bonus", pernr:who.pernr, name:who.name, date:WORKDATES[day], day:day,
+        code:"BONUS", amount:amount, note:note, p:pIdx,
+        createdBy:leader.name, onBehalf:who.pernr
+      });
+      recorded.push(who);
+    });
+    $("bAmount").value = ""; $("bNote").value = "";
+    render();
+    var msg = recorded.length
+      ? t("toast_bonus_recorded", {amount: fmt(amount), names: recorded.map(function(m){ return m.name; }).join(", ")})
+      : t("toast_bonus_none_recorded");
+    if(ineligible.length) msg += t("toast_bonus_skipped_ineligible", {names: ineligible.map(function(m){ return m.name.split(" ")[0]; }).join(", "), code: PROJECTS[pIdx].code});
+    if(noOpenDay.length) msg += t("toast_bonus_skipped_closed", {names: noOpenDay.map(function(m){ return m.name.split(" ")[0]; }).join(", ")});
+    toast(msg);
+  }
+
+  /* ---------- actions ---------- */
+  function addRow(){
+    if(isMonthly()) return addMonthRow();
+    if(state.submitted){
+      toast(t("toast_week_submitted_no_rows"));
+      return;
+    }
+    var used = state.rows.map(function(r){ return r.p; });
+    /* Same eligibility rule as addMonthRow: only a project this company
+       actually does (its own, or a shared one with no bukrs), and not
+       already on a row this week. The person then picks which one of
+       those in the dialog - see openNewRowDetail. */
+    var eligible = [];
+    for(var i=0; i<PROJECTS.length; i++){
+      if(used.indexOf(i) === -1 && (PROJECTS[i].bukrs === IT0001.bukrs || PROJECTS[i].bukrs === null)) eligible.push(i);
+    }
+    if(!eligible.length){
+      toast(t("toast_all_projects_used_week"));
+      return;
+    }
+    openNewRowDetail(eligible);
+  }
+  function copyWeek(){
+    if(state.submitted) return;
+    var prev = WEEKS[weekIdx-1];
+    var base = prev
+      ? prev.rows.map(function(r){ return {p:r.p, desc:r.desc}; })
+      : [
+          {p:0, desc:"Requirements workshop, payroll"},
+          {p:1, desc:"Time recording solution design"},
+          {p:2, desc:"Rollout follow-up"},
+          {p:3, desc:"Pre-sales and internal training"}
+        ];
+    var added = 0;
+    base.forEach(function(b){
+      if(state.rows.some(function(r){ return r.p === b.p; })) return;
+      state.rows.push({id:nextId++, p:b.p, desc:b.desc, h:[0,0,0,0,0,0,0], origin:"Copied"});
+      added++;
+    });
+    render();
+    var first = state.rows[0];
+    if(first){ var c = document.getElementById("c-"+first.id+"-0"); if(c) c.focus(); }
+    toast(added ? t("toast_copy_week_done", {n: added}) : t("toast_copy_week_none"));
+  }
+
+  /* ---------- week navigation ---------- */
+  function saveCurrentWeek(){
+    var w = WEEKS[weekIdx];
+    w.rows = state.rows;
+    w.allow = state.allow;
+    w.sugs = state.sugs;
+    w.submitted = state.submitted;
+    w.absences = ABSENCES;
+  }
+  function loadWeek(idx){
+    weekIdx = idx;
+    var w = WEEKS[weekIdx];
+    WORKDATES = datesFor(w.start);
+    DAYS = daysFor(WORKDATES);
+    ABSENCES = w.absences;
+    state.rows = w.rows;
+    state.allow = w.allow || (w.allow = []);
+    state.sugs = w.sugs;
+    state.submitted = w.submitted;
+    state.deviationNote = w.deviationNote || "";
+  }
+  /* My week's own arrows step by month for consulting (changeWeek below);
+     the Team screen's arrows (prevW2/nextW2) call this directly instead,
+     because a leader stepping through the team's log week by week isn't
+     the same navigation as the monthly My week view, even though both
+     screens read the same underlying "current week". */
+  function changeWeekByOne(delta){
+    var range = teamWeekRange();
+    var next = weekIdx + delta;
+    if(next < range.lo || next > range.hi){
+      toast(delta < 0 ? t("toast_no_earlier_weeks") : t("toast_no_later_weeks"));
+      return;
+    }
+    saveCurrentWeek();
+    loadWeek(next);
+    render();
+  }
+  /* Weeks 35/40/41 exist only so My week's month pager (consulting) has
+     more than one month to page through; Team's own week-by-week
+     navigator predates that and only ever offered weeks 36-39. Without
+     this, stepping through Team with prevW2/nextW2 could wander into
+     those extra weeks too, which reads as the mass entry screen now
+     spanning far more weeks than it used to - it should stay exactly as
+     it was before the monthly work, regardless of what My week added. */
+  function teamWeekRange(){
+    var lo = 0, hi = WEEKS.length - 1;
+    /* The week-39 cap is PT01-only: PT01 always shows the monthly view, so
+       weeks 40+ exist purely as overflow for My week's month pager, never
+       meant to be reachable from a weekly navigator. PT02 has no monthly
+       view - its own later weeks are real, navigable weeks, so it keeps
+       the full range instead of being capped at 39 too. */
+    var cap = IT0001.bukrs === "PT02" ? null : 39;
+    WEEKS.forEach(function(w, i){
+      if(w.num === 36) lo = i;
+      if(cap !== null && w.num === cap) hi = i;
+    });
+    return { lo: lo, hi: hi };
+  }
+  function changeWeek(delta){
+    if(isMonthly()) return changeMonth(delta);
+    return changeWeekByOne(delta);
+  }
+  function applyTemplate(){
+    if(state.submitted) return;
+    state.rows.forEach(function(r){
+      for(var i=0; i<5; i++){ if(!r.h[i]) r.h[i] = PROJECTS[r.p].proj ? 1.5 : 0.5; }
+    });
+    state.needsSave = true;
+    render();
+    toast(t("toast_template_applied"), t("ui_undo"), function(){ location.reload(); });
+  }
+  /* ---------- company switch, demo of the IT0001 derivation ----------
+     Changing the company is the same as opening the sheet as someone assigned
+     to the other one. Nothing else decides the layout. */
+  function seedClock(){
+    seedClockRows(state.rows);
+  }
+  /* Shared by seedClock (the currently loaded week) and the PT02 sample
+     data itself (every week, at definition time, see below): lays out
+     start/end times sequentially from 8:00, for whichever rows have an
+     hour value but no slot yet. Each row's own span bakes in the 1h lunch
+     break slotHours() now always subtracts, so reading it back gives the
+     same r.h[d] it started from. */
+  function seedClockRows(rows){
+    for(var d=0; d<7; d++){
+      var cursor = 9*60;
+      rows.forEach(function(r){
+        if(!r.h[d] || slot(r,d)) return;
+        var span = Math.round(r.h[d]*60) + LUNCH_MIN;
+        setSlot(r, d, {b:cursor, e:cursor + span});
+        cursor += span;
+      });
+    }
+  }
+  /* Approver identity and the sentence explaining whose queue this is -
+     both depend on company (a different approver per company, like the
+     approvals list itself) and on language, so this runs from both
+     switchCompany and applyI18n rather than being a one-shot data-i18n. */
+  function updateApproverChrome(){
+    if($("apActingAs")) $("apActingAs").textContent = IT0001.bukrs === "PT02" ? "Patrícia Gomes · Operations Manager, Building Solutions" : "Sofia Almeida · Delivery Manager, Consulting";
+    if($("apSubText")) $("apSubText").textContent = t(IT0001.bukrs === "PT02" ? "text_approval_sub_pt02" : "text_approval_sub");
+  }
+  function switchCompany(bukrs){
+    if(bukrs === IT0001.bukrs) return;
+    saveCurrentWeek();
+    var curNum = WEEKS[weekIdx].num;
+    IT0001.bukrs = bukrs;
+    WEEKS = bukrs === "PT02" ? WEEKS_PT02 : WEEKS_PT01;
+    state.approvals = bukrs === "PT02" ? APPROVALS_PT02 : APPROVALS_PT01;
+    updateApproverChrome();
+    /* WEEKS_PT01 and WEEKS_PT02 no longer line up index for index - PT01
+       alone has weeks either side for the monthly view - so land on the
+       same week NUMBER in the new array, not the same array position;
+       falling back to week 38 (present in both) if this company doesn't
+       have that number at all. */
+    var match = WEEKS.filter(function(w){ return w.num === curNum; })[0];
+    if(!match) match = WEEKS.filter(function(w){ return w.num === 38; })[0];
+    loadWeek(match ? WEEKS.indexOf(match) : 0);
+    if(isClock()) seedClock();
+    renderLeaderOptions();
+    clearMass();
+    render();
+    var pf = profileFor(WORKDATES[0]);
+    toast(t("toast_it0001_changed", {bukrs: bukrs, code: pf.code, fields: pf.fields.toLowerCase()}));
+  }
+
+  function togglePrivate(){
+    state.privateMode = !state.privateMode;
+    var cap = $("capture");
+    cap.classList.toggle("off", state.privateMode);
+    $("captureTxt").textContent = state.privateMode ? t("capture_off") : t("capture_on");
+    if($("privBtn")) $("privBtn").textContent = state.privateMode ? "Resume capture" : "Private mode";
+    render();
+  }
+
+  /* ---------- quick add ---------- */
+  var nlParsed = null;
+  function openQuick(prefill, day){
+    var dlg = $("dlgQuick");
+    $("nlq").value = prefill || "";
+    if(typeof day === "number") $("nlq").dataset.day = day; else delete $("nlq").dataset.day;
+    parseNL();
+    dlg.showModal();
+    setTimeout(function(){ $("nlq").focus(); },30);
+  }
+  function parseNL(){
+    var txt = $("nlq").value;
+    var box = $("nlChips");
+    box.innerHTML = "";
+    if(!txt.trim()){
+      box.appendChild(chip(t("chip_waiting_text"),""));
+      nlParsed = null;
+      $("nlSave").disabled = true;
+      return;
+    }
+    var rest = txt;
+    var dur = NaN, m;
+    if((m = rest.match(/(\d+(?:[.,]\d+)?)\s*h/i))){ dur = parseDur(m[1]); rest = rest.replace(m[0]," "); }
+    else if((m = rest.match(/(\d{1,2}):(\d{2})/))){ dur = parseDur(m[0]); rest = rest.replace(m[0]," "); }
+    else if((m = rest.match(/(\d+)\s*m(?:in)?\b/i))){ dur = parseDur(m[1]+"m"); rest = rest.replace(m[0]," "); }
+    else if((m = rest.match(/(^|\s)(\d+(?:[.,]\d+)?)(\s|$)/))){ dur = parseDur(m[2]); rest = rest.replace(m[0]," "); }
+
+    var day = $("nlq").dataset.day ? +$("nlq").dataset.day : 0;
+    var dayLabel = null;
+    var names = ["monday","tuesday","wednesday","thursday","friday","saturday","sunday"];
+    if(/\byesterday\b/i.test(rest)){ day = 1; dayLabel = "yesterday, "+DAYS[1]; rest = rest.replace(/\byesterday\b/i," "); }
+    else if(/\btoday\b/i.test(rest)){ day = 2; dayLabel = "today, "+DAYS[2]; rest = rest.replace(/\btoday\b/i," "); }
+    else {
+      for(var i=0; i<names.length; i++){
+        var re = new RegExp("\\b"+names[i]+"\\b","i");
+        if(re.test(rest)){ day = i; dayLabel = DAYS[day]; rest = rest.replace(re," "); break; }
+      }
+    }
+    if(!dayLabel) dayLabel = DAYS[day];
+
+    var pIdx = -1;
+    PROJECTS.forEach(function(pr,i){
+      var key = pr.code.split("-")[0];
+      if(new RegExp("\\b"+key+"\\b","i").test(rest)){ pIdx = i; rest = rest.replace(new RegExp(key+"[\\w-]*","i")," "); }
+    });
+    var desc = rest.replace(/\s+/g," ").trim();
+
+    box.appendChild(chipBtn(isNaN(dur) || !dur ? "duration to set" : fmt(dur)+" h", isNaN(dur) || !dur ? "warnc" : "okc", function(){
+      var v = window.prompt("Duration (e.g. 1.5, 1:30, 90m)", isNaN(dur) || !dur ? "" : fmt(dur));
+      if(v === null) return;
+      var parsed = parseDur(v);
+      if(isNaN(parsed) || parsed <= 0){ toast(t("toast_bad_duration", {v: v})); return; }
+      $("nlq").value = nlText(round15(parsed), day, pIdx, desc);
+      parseNL();
+    }));
+    box.appendChild(chipBtn(dayLabel, "okc", function(){
+      $("nlq").value = nlText(dur, (day + 1) % 7, pIdx, desc);
+      parseNL();
+    }));
+    box.appendChild(chipSelect(
+      pIdx === -1 ? "" : String(pIdx),
+      PROJECTS.map(function(p,i){ return {value:String(i), label:p.code + " · " + p.name}; }),
+      pIdx === -1 ? "warnc" : "okc",
+      function(v){
+        if(v === "") return;
+        $("nlq").value = nlText(dur, day, +v, desc);
+        parseNL();
+      },
+      "project to choose"
+    ));
+    box.appendChild(chip(pIdx === -1 ? "activity to set" : PROJECTS[pIdx].act, pIdx === -1 ? "" : "okc"));
+    if(pIdx !== -1) box.appendChild(chip(PROJECTS[pIdx].sap.rproj ? "PEP "+PROJECTS[pIdx].sap.rproj : "cost center "+PROJECTS[pIdx].sap.rkostl, "okc"));
+    if(desc) box.appendChild(chip("description: "+desc.slice(0,42), "okc"));
+
+    var ok = !isNaN(dur) && dur > 0 && pIdx !== -1;
+    nlParsed = ok ? {dur:round15(dur), day:day, p:pIdx, desc:desc} : null;
+    $("nlSave").disabled = !ok;
+  }
+  /* Returns whether the entry was actually saved: the dialog is a native
+     <form method="dialog">, which closes itself on any button click
+     regardless of what the handler does, so the onclick wrapper below needs
+     this to know when to preventDefault() and keep it open instead, rather
+     than closing over a rejected save as if it had gone through. */
+  function saveNL(){
+    if(!nlParsed) return false;
+    if(state.submitted){ toast(t("toast_week_submitted_locked")); return false; }
+    if(isBlocked(nlParsed.day)){ toast(t("toast_day_absence_blocked", {day: DAYS[nlParsed.day]})); return false; }
+    if(!periodOpen(WORKDATES[nlParsed.day])){ toast(t("toast_day_closed_period", {day: DAYS[nlParsed.day]})); return false; }
+    var row = state.rows.filter(function(r){ return r.p === nlParsed.p; })[0];
+    if(!row){ row = {id:nextId++, p:nlParsed.p, desc:nlParsed.desc, h:[0,0,0,0,0,0,0], origin:"Manual"}; state.rows.push(row); }
+    if(nlParsed.desc) row.desc = nlParsed.desc;
+    row.h[nlParsed.day] += nlParsed.dur;
+    state.needsSave = true;
+    render();
+    toast(t("toast_hours_recorded", {h: fmt(nlParsed.dur), code: PROJECTS[nlParsed.p].code, day: DAYS[nlParsed.day]}));
+    return true;
+  }
+
+  /* ---------- detail ---------- */
+  var dtRow = null;
+  /* Set instead of dtRow when the detail dialog is opened from the month
+     grid: {monthRow, weeks}. A month row isn't one row object, it's one
+     per week that happens to have hours against that project (see
+     monthProjectRows/monthRowIn), so changing its project or description
+     has to reach every one of them, not just whichever week is loaded. */
+  var dtMonthCtx = null;
+  /* Set instead of dtRow/dtMonthCtx when the detail dialog is opened from
+     "Add row" to let the person pick which still-unused project the new
+     row is for, rather than the app silently picking one: {eligible} for
+     the week grid, {eligible, target, weeks, monthly:true} for the month
+     grid (target is the week the new row is pushed into). */
+  var dtNewRow = null;
+  /* Fills the detail dialog's project <select> with one <option> per index
+     in indices, "CODE · Name" - the name, not the WBS, since a non-project
+     activity like AXI-INT has no WBS to show and the code alone isn't
+     enough to tell apart two similarly-named projects while the list is
+     still open (the WBS itself is still visible once something is picked,
+     on the row above it, and in the dialog's own title). openDetail/
+     openMonthDetail (every project) and openNewRowDetail/openNewMonthRowDetail
+     (only the eligible ones) each built this same option list themselves. */
+  /* Only proj:true entries need a description (val_desc_required), so the
+     hint has to say so: a project-less activity like AXI-INT otherwise
+     reads as "required" when it's actually optional. Re-run on every
+     project change and, since the dialog can stay open across a language
+     switch, from applyI18n too. */
+  function updateDescPlaceholder(pIdx){
+    var desc = $("dtDesc");
+    if(desc) desc.placeholder = t(PROJECTS[pIdx].proj ? "placeholder_description" : "placeholder_description_optional");
+  }
+  function fillProjectOptions(pj, indices){
+    pj.innerHTML = "";
+    indices.forEach(function(i){
+      var p = PROJECTS[i];
+      var o = document.createElement("option");
+      o.value = String(i); o.textContent = p.code + " · " + p.name;
+      pj.appendChild(o);
+    });
+  }
+  /* day is which calendar column was clicked, only meaningful for Z_BSRV
+     (Building Solutions): that profile records start and end per day, not
+     one duration for the week, so a day-specific click there needs to
+     show that day's actual window, not the row's total. */
+  function openDetail(r, day){
+    dtRow = r;
+    dtMonthCtx = null;
+    dtNewRow = null;
+    var pr = PROJECTS[r.p];
+    $("dtTitle").textContent = pr.name;
+    var pj = $("dtProj");
+    fillProjectOptions(pj, PROJECTS.map(function(p,i){ return i; }));
+    pj.value = String(r.p);
+    pj.disabled = state.submitted;
+    /* Activity type isn't its own choice here, it comes from whichever
+       project is picked (each project has exactly one, in SAP terms its
+       LSTAR), so it follows the project select instead of being a second,
+       independent field that could disagree with it. */
+    pj.onchange = function(){ $("dtAct").value = PROJECTS[+pj.value].act; setDetailBudgetAndAudit(+pj.value, ["row", r.id]); updateDescPlaceholder(+pj.value); };
+    $("dtDur").value = fmt(rowTotal(r));
+    $("dtDesc").value = r.desc;
+    $("dtAct").value = pr.act;
+    $("dtOrigin").textContent = originLabel(r.origin);
+    setDetailBudgetAndAudit(r.p, ["row", r.id]);
+    updateDescPlaceholder(r.p);
+    var showClock = isClock() && typeof day === "number";
+    $("dtStartField").hidden = !showClock;
+    $("dtEndField").hidden = !showClock;
+    if(showClock){
+      var s = slot(r, day);
+      $("dtStart").value = s && s.b !== null ? fmtClock(s.b) : "–";
+      $("dtEnd").value = s && s.e !== null ? fmtClock(s.e % 1440) : "–";
+    }
+    var st = $("dtState");
+    st.textContent = state.submitted ? t("state_in_approval") : t("state_draft");
+    st.className = state.submitted ? "chip blue" : "chip grey";
+    $("dtDesc").readOnly = state.submitted;
+    $("dtDur").readOnly = true;
+    $("dtSave").disabled = state.submitted;
+    $("dlgDetail").showModal();
+  }
+  /* Same dialog, opened from a month-grid row instead: monthRow is the
+     {p, desc} placeholder monthProjectRows() hands out, weeks is every
+     week the visible month touches. There's no single row to point at
+     (see dtMonthCtx above), so this reads the total and description live
+     across whichever of those weeks actually has a row for the project. */
+  function openMonthDetail(monthRow, weeks){
+    dtRow = null;
+    dtMonthCtx = {monthRow: monthRow, weeks: weeks};
+    dtNewRow = null;
+    var pr = PROJECTS[monthRow.p];
+    var allSubmitted = weeks.every(function(w){ return w.submitted; });
+    $("dtTitle").textContent = pr.name;
+    var pj = $("dtProj");
+    fillProjectOptions(pj, PROJECTS.map(function(p,i){ return i; }));
+    pj.value = String(monthRow.p);
+    pj.disabled = allSubmitted;
+    pj.onchange = function(){ $("dtAct").value = PROJECTS[+pj.value].act; setDetailBudgetAndAudit(+pj.value, ["month", monthRow.p, weeks[0] ? weeks[0].num : 0]); updateDescPlaceholder(+pj.value); };
+    updateDescPlaceholder(monthRow.p);
+    var total = weeks.reduce(function(a,w){
+      var r = monthRowIn(w, monthRow.p);
+      return a + (r ? rowTotal(r) : 0);
+    }, 0);
+    $("dtDur").value = fmt(total);
+    $("dtDesc").value = monthRow.desc || "";
+    $("dtAct").value = pr.act;
+    $("dtOrigin").textContent = t("val_manual");
+    setDetailBudgetAndAudit(monthRow.p, ["month", monthRow.p, weeks[0] ? weeks[0].num : 0]);
+    $("dtStartField").hidden = true;
+    $("dtEndField").hidden = true;
+    var st = $("dtState");
+    st.textContent = allSubmitted ? t("state_in_approval") : t("state_draft");
+    st.className = allSubmitted ? "chip blue" : "chip grey";
+    $("dtDesc").readOnly = allSubmitted;
+    $("dtDur").readOnly = true;
+    $("dtSave").disabled = allSubmitted;
+    $("dlgDetail").showModal();
+  }
+  /* Same dialog again, this time with no row behind it yet: opened from
+     "Add row" so the person picks the project themselves instead of the
+     app auto-assigning the first still-unused one. pj only lists eligible
+     (not yet used this week/month, and belonging to this company or
+     shared) projects, so there's nothing here saveDetail's clash-check
+     would ever need to reject. */
+  function openNewRowDetail(eligible){
+    dtRow = null;
+    dtMonthCtx = null;
+    dtNewRow = {eligible: eligible};
+    $("dtTitle").textContent = t("dlg_new_entry_title");
+    var pj = $("dtProj");
+    fillProjectOptions(pj, eligible);
+    pj.value = String(eligible[0]);
+    pj.disabled = false;
+    pj.onchange = function(){ $("dtAct").value = PROJECTS[+pj.value].act; setDetailBudgetAndAudit(+pj.value, ["newrow", +pj.value]); updateDescPlaceholder(+pj.value); };
+    $("dtDur").value = fmt(0);
+    $("dtDesc").value = "";
+    $("dtAct").value = PROJECTS[eligible[0]].act;
+    $("dtOrigin").textContent = t("val_manual");
+    setDetailBudgetAndAudit(eligible[0], ["newrow", eligible[0]]);
+    updateDescPlaceholder(eligible[0]);
+    $("dtStartField").hidden = true;
+    $("dtEndField").hidden = true;
+    var st = $("dtState");
+    st.textContent = t("state_draft");
+    st.className = "chip grey";
+    $("dtDesc").readOnly = false;
+    $("dtDur").readOnly = true;
+    $("dtSave").disabled = false;
+    $("dlgDetail").showModal();
+  }
+  function openNewMonthRowDetail(eligible, target, weeks){
+    dtRow = null;
+    dtMonthCtx = null;
+    dtNewRow = {eligible: eligible, target: target, weeks: weeks, monthly: true};
+    $("dtTitle").textContent = t("dlg_new_entry_title");
+    var pj = $("dtProj");
+    fillProjectOptions(pj, eligible);
+    pj.value = String(eligible[0]);
+    pj.disabled = false;
+    pj.onchange = function(){ $("dtAct").value = PROJECTS[+pj.value].act; setDetailBudgetAndAudit(+pj.value, ["newmonthrow", +pj.value, weeks[0] ? weeks[0].num : 0]); updateDescPlaceholder(+pj.value); };
+    $("dtDur").value = fmt(0);
+    $("dtDesc").value = "";
+    $("dtAct").value = PROJECTS[eligible[0]].act;
+    $("dtOrigin").textContent = t("val_manual");
+    setDetailBudgetAndAudit(eligible[0], ["newmonthrow", eligible[0], weeks[0] ? weeks[0].num : 0]);
+    updateDescPlaceholder(eligible[0]);
+    $("dtStartField").hidden = true;
+    $("dtEndField").hidden = true;
+    var st = $("dtState");
+    st.textContent = t("state_draft");
+    st.className = "chip grey";
+    $("dtDesc").readOnly = false;
+    $("dtDur").readOnly = true;
+    $("dtSave").disabled = false;
+    $("dlgDetail").showModal();
+  }
+  function saveNewRow(){
+    var ctx = dtNewRow;
+    if(!ctx) return;
+    var p = +$("dtProj").value;
+    var row = {id:nextId++, p:p, desc:$("dtDesc").value, h:[0,0,0,0,0,0,0], origin:"Manual"};
+    if(ctx.monthly) ctx.target.rows.push(row);
+    else state.rows.push(row);
+    state.needsSave = true;
+    dtNewRow = null;
+    render();
+    toast(t("toast_entry_added"));
+    $("dlgDetail").close();
+    if(ctx.monthly){
+      var descs = document.querySelectorAll(".monthdesc");
+      var last = descs[descs.length-1];
+      if(last) last.focus();
+    } else {
+      var c = document.getElementById("c-"+row.id+"-0");
+      if(c) c.focus();
+    }
+  }
+  function saveDetail(){
+    if(dtNewRow) return saveNewRow();
+    if(dtMonthCtx) return saveMonthDetail();
+    if(!dtRow) return;
+    var pj = $("dtProj");
+    if(pj && !pj.disabled){
+      var newP = +pj.value;
+      if(newP !== dtRow.p){
+        /* Every other path that touches state.rows (addRow, Quick Add,
+           the chat) keeps at most one row per project, finding-or-creating
+           rather than ever duplicating one. Re-pointing this row at a
+           project that already has its own row would break that, and
+           silently merging the two could surprise someone who didn't ask
+           for their hours combined - so this asks them to resolve it on
+           the grid first instead. */
+        var clash = state.rows.some(function(r){ return r !== dtRow && r.p === newP; });
+        if(clash){
+          toast(t("toast_row_exists_week", {code: PROJECTS[newP].code}));
+          return;
+        }
+        dtRow.p = newP;
+      }
+    }
+    dtRow.desc = $("dtDesc").value;
+    state.needsSave = true;
+    render();
+    toast(t("toast_entry_updated"));
+    $("dlgDetail").close();
+  }
+  /* Same clash rule as saveDetail, checked across every week the month
+     row touches: re-pointing it at a project that already has its own
+     row in ANY of those weeks would collide with monthRowIn() there. */
+  function saveMonthDetail(){
+    var ctx = dtMonthCtx;
+    if(!ctx) return;
+    var rows = ctx.weeks.map(function(w){ return monthRowIn(w, ctx.monthRow.p); }).filter(function(r){ return r; });
+    var pj = $("dtProj");
+    if(pj && !pj.disabled){
+      var newP = +pj.value;
+      if(newP !== ctx.monthRow.p){
+        var clash = ctx.weeks.some(function(w){ return w.rows.some(function(r){ return r.p === newP; }); });
+        if(clash){
+          toast(t("toast_row_exists_month", {code: PROJECTS[newP].code}));
+          return;
+        }
+        rows.forEach(function(r){ r.p = newP; });
+      }
+    }
+    var newDesc = $("dtDesc").value;
+    rows.forEach(function(r){ r.desc = newDesc; });
+    state.needsSave = true;
+    render();
+    toast(t("toast_entry_updated"));
+    $("dlgDetail").close();
+  }
+
+  /* ---------- submit ---------- */
+  function openSubmitMonth(){
+    var dates = activeMonthDates();
+    var weeks = touchedWeeksFor(dates);
+    var first = weeks[0];
+    var ym = monthKeyOf(WEEKS[weekIdx]);
+    var y = ym.slice(0,4), mIdx = +ym.slice(4,6) - 1;
+    var monthName = monthFullName(mIdx);
+    $("subTitle").textContent = t("dlg_submit_month_title", {month: monthName, y: y});
+    var byP = {};
+    weeks.forEach(function(w){
+      w.rows.forEach(function(r){
+        var t = rowTotal(r);
+        if(!t) return;
+        var k = PROJECTS[r.p].code;
+        if(!byP[k]) byP[k] = {name:PROJECTS[r.p].name, t:0, b:PROJECTS[r.p].proj, wbs:PROJECTS[r.p].sap.rproj || PROJECTS[r.p].sap.rkostl};
+        byP[k].t += t;
+      });
+    });
+    var body = $("subBody");
+    body.innerHTML = "";
+    var sum = el("div","sum","");
+    Object.keys(byP).forEach(function(k){
+      var o = byP[k];
+      var r = el("div","r","");
+      r.appendChild(el("span","", o.name));
+      r.appendChild(el("span","chip "+(o.b?"blue":"grey"), o.wbs));
+      r.appendChild(el("span","n", fmt(o.t)+" h"));
+      sum.appendChild(r);
+    });
+    var monthProj = weeks.reduce(function(a,w){ return a + w.rows.reduce(function(x,r){ return x + (PROJECTS[r.p].proj ? rowTotal(r) : 0); }, 0); }, 0);
+    var tr = el("div","r t","");
+    tr.appendChild(el("span","",t("label_month_total")));
+    tr.appendChild(el("span","", t("text_h_in_project", {h: fmt(monthProj)})));
+    tr.appendChild(el("span","n", fmt(monthTotalHours(dates))+" h"));
+    sum.appendChild(tr);
+    body.appendChild(sum);
+
+    var warns = [];
+    weeks.forEach(function(w){
+      withWeek(w, function(){ validate().filter(function(m){ return m.sev === "w"; }).forEach(function(m){ warns.push({week:w, txt:m.txt}); }); });
+    });
+    if(warns.length){
+      var wDiv = el("div","","");
+      wDiv.innerHTML = "<div class='field'><label>"+plural(warns.length, "n_warnings_no_block")+"</label></div>";
+      var ul = el("div","sum","");
+      warns.forEach(function(m){
+        var r = el("div","r","");
+        r.appendChild(el("span","", t("val_week_label_prefix", {n: m.week.num, txt: m.txt})));
+        r.appendChild(el("span","chip amber",t("chip_warning_lower")));
+        r.appendChild(el("span","",""));
+        ul.appendChild(r);
+      });
+      wDiv.appendChild(ul);
+      body.appendChild(wDiv);
+      var f = el("div","field","");
+      f.innerHTML = "<label for='subWhy'>"+t("label_deviation_justification")+"</label><textarea id='subWhy' placeholder=\""+t("placeholder_justification_month")+"\"></textarea>";
+      body.appendChild(f);
+      $("subWhy").value = first.deviationNote || "";
+    }
+    $("dlgSubmit").showModal();
+  }
+  function doSubmitMonth(){
+    var weeks = activeMonthWeeks();
+    var why = $("subWhy");
+    var note = why ? why.value.trim() : "";
+    weeks.forEach(function(w){ w.deviationNote = note; w.submitted = true; });
+    state.submitted = true;
+    state.needsSave = true;
+    state.deviationNote = note;
+    $("dlgSubmit").close();
+    render();
+    toast(plural(weeks.length, "weeks_submitted_approval"), t("ui_reopen"), function(){
+      weeks.forEach(function(w){ w.submitted = false; });
+      state.needsSave = false;
+      render();
+    });
+  }
+  function openSubmit(){
+    if(isMonthly()) return openSubmitMonth();
+    $("subTitle").textContent = t("dlg_submit_week_title", {n: WEEKS[weekIdx].num});
+    var byP = {};
+    state.rows.forEach(function(r){
+      var t = rowTotal(r);
+      if(!t) return;
+      var k = PROJECTS[r.p].code;
+      if(!byP[k]) byP[k] = {name:PROJECTS[r.p].name, t:0, b:PROJECTS[r.p].proj, wbs:PROJECTS[r.p].sap.rproj || PROJECTS[r.p].sap.rkostl};
+      byP[k].t += t;
+    });
+    var body = $("subBody");
+    body.innerHTML = "";
+    var sum = el("div","sum","");
+    Object.keys(byP).forEach(function(k){
+      var o = byP[k];
+      var r = el("div","r","");
+      r.appendChild(el("span","", o.name));
+      r.appendChild(el("span","chip "+(o.b?"blue":"grey"), o.wbs));
+      r.appendChild(el("span","n", fmt(o.t)+" h"));
+      sum.appendChild(r);
+    });
+    var tr = el("div","r t","");
+    tr.appendChild(el("span","",t("label_week_total")));
+    tr.appendChild(el("span","", t("text_h_in_project", {h: fmt(projTotal())})));
+    tr.appendChild(el("span","n", fmt(weekTotal())+" h"));
+    sum.appendChild(tr);
+    body.appendChild(sum);
+
+    var warns = validate().filter(function(m){ return m.sev === "w"; });
+    if(warns.length){
+      var w = el("div","","");
+      w.innerHTML = "<div class='field'><label>"+plural(warns.length, "n_warnings_no_block")+"</label></div>";
+      var ul = el("div","sum","");
+      warns.forEach(function(m){
+        var r = el("div","r","");
+        r.appendChild(el("span","", m.txt));
+        r.appendChild(el("span","chip amber",t("chip_warning_lower")));
+        r.appendChild(el("span","",""));
+        ul.appendChild(r);
+      });
+      w.appendChild(ul);
+      body.appendChild(w);
+      var f = el("div","field","");
+      f.innerHTML = "<label for='subWhy'>"+t("label_deviation_justification")+"</label><textarea id='subWhy' placeholder=\""+t("placeholder_justification_week")+"\"></textarea>";
+      body.appendChild(f);
+      $("subWhy").value = state.deviationNote || "";
+    }
+    $("dlgSubmit").showModal();
+  }
+  function doSubmit(){
+    if(isMonthly()) return doSubmitMonth();
+    var why = $("subWhy");
+    state.deviationNote = why ? why.value.trim() : "";
+    WEEKS[weekIdx].deviationNote = state.deviationNote;
+    state.submitted = true;
+    state.needsSave = true;
+    $("dlgSubmit").close();
+    render();
+    toast(t("toast_week_submitted_approval", {n: WEEKS[weekIdx].num}), t("ui_reopen"), function(){ state.submitted = false; state.needsSave = false; render(); });
+  }
+
+  /* ---------- approvals ---------- */
+  function renderApprovals(){
+    var body = $("apBody");
+    if(!body) return;
+    body.innerHTML = "";
+    var clean = state.approvals.filter(function(a){ return !a.warn; });
+    var flagged = state.approvals.filter(function(a){ return a.warn; });
+    var apHours = $("apHours");
+    if(apHours) apHours.innerHTML = fmt(state.approvals.reduce(function(a,x){ return a+x.tot; }, 0)) + "<small> h</small>";
+    var apDev = $("apDev");
+    if(apDev){
+      var dev = state.approvals.reduce(function(a,x){ return a+x.dev; }, 0);
+      apDev.innerHTML = (dev>0?"+":"") + fmt(dev) + "<small> h</small>";
+    }
+
+    function group(title, list, cls){
+      if(!list.length) return;
+      var gh = document.createElement("tr");
+      gh.className = "grouphead";
+      var td = document.createElement("td");
+      td.colSpan = 7; td.textContent = title;
+      gh.appendChild(td); body.appendChild(gh);
+      list.forEach(function(a){
+        var tr = document.createElement("tr");
+        var c1 = document.createElement("td");
+        var cb = document.createElement("input");
+        cb.type = "checkbox"; cb.checked = a.sel; cb.disabled = !!a.warn;
+        cb.setAttribute("aria-label",t("aria_select_timesheet_for", {name: a.who}));
+        cb.onchange = function(){ a.sel = cb.checked; renderApprovals(); };
+        c1.appendChild(cb); tr.appendChild(c1);
+        var c2 = document.createElement("td");
+        var whoBtn = document.createElement("button");
+        whoBtn.type = "button";
+        whoBtn.className = "apwho";
+        whoBtn.setAttribute("aria-expanded", a.expanded ? "true" : "false");
+        whoBtn.innerHTML = "<span class='apchev'>"+(a.expanded ? "▾" : "▸")+"</span><span><div class='who'>"+a.who+"</div><div class='sub'>"+a.role+"</div></span>";
+        whoBtn.onclick = function(){ a.expanded = !a.expanded; renderApprovals(); };
+        c2.appendChild(whoBtn);
+        tr.appendChild(c2);
+        tr.appendChild(td2(a.proj, "num"));
+        tr.appendChild(td2(fmt(a.tot)+" h","n"));
+        tr.appendChild(td2(fmt(a.inproj)+" h","n"));
+        tr.appendChild(td2((a.dev>0?"+":"")+fmt(a.dev)+" h","n"));
+        var c7 = document.createElement("td");
+        c7.innerHTML = a.warn
+          ? "<span class='chip amber'>"+approvalNoteLabel(a.note)+"</span>"
+          : (a.approved ? "<span class='chip green'>"+t("chip_approved")+"</span>" : "<span class='chip blue'>"+t("chip_in_approval")+"</span>");
+        tr.appendChild(c7);
+        body.appendChild(tr);
+        if(a.expanded){
+          var dtr = document.createElement("tr");
+          dtr.className = "apdetail";
+          var dtd = document.createElement("td");
+          dtd.colSpan = 7;
+          var wrap = document.createElement("div");
+          wrap.className = "apdays";
+          (a.days || []).forEach(function(h, i){
+            var d = document.createElement("span");
+            d.className = "apday" + (h ? "" : " empty");
+            d.textContent = WEEKDAY_ABBR[i] + " " + (h ? fmt(h)+"h" : "–");
+            wrap.appendChild(d);
+          });
+          dtd.appendChild(wrap);
+          dtr.appendChild(dtd);
+          body.appendChild(dtr);
+        }
+      });
+    }
+    group(t("hdr_no_warnings_group"), clean);
+    group(t("hdr_exceptions_group"), flagged);
+
+    var sel = state.approvals.filter(function(a){ return a.sel; }).length;
+    $("apSel").textContent = plural(sel, "n_selected");
+    $("apApprove").disabled = sel === 0;
+    var pend = state.approvals.filter(function(a){ return !a.approved; }).length;
+    $("apPend").textContent = pend;
+    $("apWarn").textContent = flagged.filter(function(a){ return !a.approved; }).length;
+  }
+  function td2(txt, cls){ var td = document.createElement("td"); td.className = cls || ""; td.textContent = txt; return td; }
+
+  /* ---------- helpers ---------- */
+  function el(tag, cls, txt){ var n = document.createElement(tag); if(cls) n.className = cls; if(txt) n.textContent = txt; return n; }
+  function btn(txt, cls, fn){ var b = document.createElement("button"); b.className = cls || "btn"; b.textContent = txt; if(fn) b.onclick = fn; return b; }
+  function chip(txt, cls){ var s = document.createElement("span"); s.className = "pchip " + (cls||""); s.textContent = txt; return s; }
+  function chipBtn(txt, cls, fn){ var b = document.createElement("button"); b.type = "button"; b.className = "pchip clickable " + (cls||""); b.textContent = txt; b.onclick = fn; return b; }
+  /* A picklist styled as a chip, for the one place (Quick Add) that used to
+     ask for a project code via window.prompt(): free text, no list of what's
+     valid, easy to typo. options is [{value, label}]; placeholder, when
+     given, is an extra unselectable first option for "nothing chosen yet". */
+  function chipSelect(value, options, cls, fn, placeholder){
+    var s = document.createElement("select");
+    s.className = "pchip clickable " + (cls||"");
+    if(placeholder){
+      var ph = document.createElement("option");
+      ph.value = ""; ph.textContent = placeholder; ph.disabled = true;
+      if(value === "") ph.selected = true;
+      s.appendChild(ph);
+    }
+    options.forEach(function(o){
+      var opt = document.createElement("option");
+      opt.value = o.value; opt.textContent = o.label;
+      if(o.value === value) opt.selected = true;
+      s.appendChild(opt);
+    });
+    s.onchange = function(){ fn(s.value); };
+    return s;
+  }
+  function dayWordFor(day){ var names = ["monday","tuesday","wednesday","thursday","friday","saturday","sunday"]; return names[day] !== undefined ? names[day] : names[2]; }
+  function nlText(dur, day, pIdx, desc){
+    var parts = [];
+    if(!isNaN(dur) && dur > 0) parts.push(fmt(dur)+"h");
+    parts.push(dayWordFor(day));
+    if(pIdx !== -1) parts.push(PROJECTS[pIdx].code.split("-")[0]);
+    if(desc) parts.push(desc);
+    return parts.join(" ");
+  }
+  function toast(txt, actionLabel, fn){
+    var box = $("toasts");
+    var t = el("div","toast","");
+    t.appendChild(el("span","", txt));
+    if(actionLabel){ t.appendChild(btn(actionLabel,"", function(){ fn(); box.removeChild(t); })); }
+    box.appendChild(t);
+    setTimeout(function(){ if(t.parentNode) box.removeChild(t); }, 8000);
+  }
+  /* A number changing inside an existing cell (an assistant entry merges
+     into whatever that project/day already had) is easy to miss, there's
+     no new row to draw the eye. Scrolls to the exact cell that changed and
+     flashes it, so "did that actually save?" has an obvious answer. */
+  function flashCell(rowId, day){
+    var cell = document.getElementById("c-"+rowId+"-"+day);
+    if(!cell) return;
+    cell.scrollIntoView({block:"center", behavior:"smooth"});
+    cell.classList.remove("just-saved");
+    void cell.offsetWidth;
+    cell.classList.add("just-saved");
+    setTimeout(function(){ cell.classList.remove("just-saved"); }, 1800);
+  }
+
+  /* ---------- wiring ---------- */
+  $("addRow").onclick = addRow;
+  $("copyWeek").onclick = copyWeek;
+  $("tplBtn").onclick = applyTemplate;
+  $("quickBtn").onclick = function(){ openQuick("", 2); };
+  $("submitBtn").onclick = openSubmit;
+  if($("saveBtn")) $("saveBtn").onclick = saveChanges;
+  if($("submitBtnBottom")) $("submitBtnBottom").onclick = openSubmit;
+  if($("saveBtnBottom")) $("saveBtnBottom").onclick = saveChanges;
+  $("sugChip").onclick = function(){ $("sugPanel").scrollIntoView({block:"center"}); };
+  $("acceptHi").onclick = function(){
+    var hi = visibleSugs().filter(function(s){ return s.conf === "hi"; });
+    if(!hi.length) return;
+    hi.forEach(acceptSug);
+    toast(t("toast_high_conf_applied", {n: hi.length}));
+  };
+  $("vGrid").onclick = function(){ setView(true); };
+  $("vCal").onclick = function(){ setView(false); };
+  function setView(grid){
+    $("viewGrid").hidden = !grid; $("viewCal").hidden = grid;
+    $("vGrid").setAttribute("aria-pressed", grid ? "true" : "false");
+    $("vCal").setAttribute("aria-pressed", grid ? "false" : "true");
+    if($("addRow")) $("addRow").hidden = !grid;
+  }
+  function saveChanges(){
+    state.needsSave = false;
+    render();
+    toast(t("toast_changes_saved"));
+  }
+  /* A second Save/Submit pair at the foot of the grid, so a long week or
+     month doesn't force a scroll back to the top just to save or submit
+     after filling it in. The top pair stays too, as a shortcut for
+     someone who hasn't scrolled down at all. */
+  function syncBottomSaveSubmit(){
+    var top = $("submitBtn"), bottom = $("submitBtnBottom");
+    if(bottom){ bottom.disabled = top.disabled; bottom.textContent = top.textContent; }
+  }
+  $("nlq").addEventListener("input", parseNL);
+  $("nlSave").onclick = function(ev){ if(!saveNL()) ev.preventDefault(); };
+  $("dtSave").onclick = saveDetail;
+  $("dtCancel").onclick = function(){ dtNewRow = null; $("dlgDetail").close(); };
+  $("subCancel").onclick = function(){ $("dlgSubmit").close(); };
+  $("subOk").onclick = doSubmit;
+  $("dataBtn").onclick = function(){ $("dlgData").showModal(); };
+  $("dataClose").onclick = function(){ $("dlgData").close(); };
+  $("dataWipe").onclick = function(){ $("dlgData").close(); state.sugs = []; render(); toast(t("toast_timeline_deleted")); };
+  $("helpBtn").onclick = function(){ $("dlgHelp").showModal(); };
+  $("helpClose").onclick = function(){ $("dlgHelp").close(); };
+  if($("settingsBtn")) $("settingsBtn").onclick = function(){
+    ["pt","en","fr"].forEach(function(l){
+      var b = $("lang" + l.toUpperCase());
+      if(b) b.setAttribute("aria-pressed", state.lang === l ? "true" : "false");
+    });
+    $("dlgSettings").showModal();
+  };
+  if($("settingsClose")) $("settingsClose").onclick = function(){ $("dlgSettings").close(); };
+  ["langPT","langEN","langFR"].forEach(function(id){
+    var b = $(id);
+    if(!b) return;
+    b.onclick = function(){ setLang(b.getAttribute("data-lang")); $("dlgSettings").close(); };
+  });
+  $("prevW").onclick = function(){ changeWeek(-1); };
+  $("nextW").onclick = function(){ changeWeek(1); };
+  if($("prevW2")) $("prevW2").onclick = function(){ changeWeekByOne(-1); };
+  if($("nextW2")) $("nextW2").onclick = function(){ changeWeekByOne(1); };
+
+  $("fTbl").onclick = function(){ setFmt(true); };
+  $("fPay").onclick = function(){ setFmt(false); };
+  function setFmt(tbl){
+    $("catsTable").hidden = !tbl; $("catsPayload").hidden = tbl;
+    $("fTbl").setAttribute("aria-pressed", tbl ? "true" : "false");
+    $("fPay").setAttribute("aria-pressed", tbl ? "false" : "true");
+  }
+
+  $("apAll").onchange = function(){
+    var on = $("apAll").checked;
+    state.approvals.forEach(function(a){ if(!a.warn) a.sel = on; });
+    renderApprovals();
+  };
+  $("apSelClean").onclick = function(){
+    state.approvals.forEach(function(a){ if(!a.warn) a.sel = true; });
+    renderApprovals();
+  };
+  $("apApprove").onclick = function(){
+    var n = 0;
+    state.approvals.forEach(function(a){ if(a.sel){ a.approved = true; a.sel = false; n++; } });
+    renderApprovals();
+    toast(t("toast_timesheets_approved", {n: n}));
+  };
+
+  Array.prototype.forEach.call(document.querySelectorAll(".nav button"), function(b){
+    b.onclick = function(){
+      var s = b.dataset.screen;
+      Array.prototype.forEach.call(document.querySelectorAll(".nav button"), function(x){ x.setAttribute("aria-current", x === b ? "true" : "false"); });
+      ["semana","team","aprov","cats"].forEach(function(k){ $("screen-"+k).hidden = k !== s; });
+      state.screen = s;
+      if(s === "cats") renderCats();
+      if(s === "team") renderTeam();
+      window.scrollTo({top:0});
+    };
+  });
+
+  /* ---------- conversational assistant, Joule pattern ---------- */
+  var chat = {pending:null, greeted:false, draft:null, draftWeek:null, history:[], busy:false};
+  var VOICE_LANGS = {PT:"pt-PT", EN:"en-US", FR:"fr-FR"};
+  var VOICE_LANG_NAMES = {PT:"Portuguese", EN:"English", FR:"French"};
+  var VOICE_LANG_ORDER = ["PT","EN","FR"];
+  var voice = {lang:"PT", usedVoice:false, speakReply:false};
+  function speakText(txt){
+    if(!voice.speakReply || !window.speechSynthesis) return;
+    try{
+      var u = new SpeechSynthesisUtterance(txt);
+      u.lang = VOICE_LANGS[voice.lang];
+      window.speechSynthesis.speak(u);
+    }catch(e){}
+  }
+
+  function botToggle(force){
+    var p = $("joulePanel");
+    var open = typeof force === "boolean" ? force : p.hidden;
+    p.hidden = !open;
+    $("jouleFab").setAttribute("aria-expanded", open ? "true" : "false");
+    if(!open && window.speechSynthesis) window.speechSynthesis.cancel();
+    if(open){
+      if(!chat.greeted){
+        chat.greeted = true;
+        botSay("bot", t("bot_greeting", {name: EMPLOYEE_NAME.split(" ")[0]}));
+        botChips([t("chip_hours_i_have"),t("chip_my_absences"),t("chip_bnk_example"),t("chip_submit_week")]);
+      }
+      setTimeout(function(){ $("jinput").focus(); }, 60);
+    }
+  }
+  /* applyI18n's hook for the one corner a static data-i18n sweep can't
+     reach: the chat log is a transcript, built once from whichever
+     language was active line by line, not re-rendered from scratch like
+     the rest of the page. Nothing real said yet (still just the
+     auto-greeting, chat.history empty) isn't really "history" though, so
+     it's safe to reset and re-greet fresh in the new language instead of
+     leaving it stuck in whichever language the panel first opened in. A
+     real exchange is left exactly as it was said - only the quick-reply
+     chips get cleared, since those are live actions, not a transcript,
+     and worded in the wrong language they'd be actively misleading. */
+  function refreshAssistantForLang(){
+    if(typeof chat === "undefined") return;
+    if(chat.greeted && !chat.history.length){
+      chat.greeted = false;
+      var log = $("jlog");
+      if(log) log.innerHTML = "";
+      botChips([]);
+      if($("joulePanel") && !$("joulePanel").hidden) botToggle(true);
+    } else if(chat.history.length){
+      botChips([]);
+    }
+  }
+  /* allowHtml is opt-in and only for our own static strings (the two help
+     messages that style an example with <span class="num">). Everything
+     else here can carry text the person typed or, for a Claude-backed
+     reply, text the model wrote after reading what the person typed -
+     prompt injection could put markup in either - so the default stays
+     textContent, never innerHTML, for both bot and user lines. */
+  function botSay(who, txt, node, allowHtml){
+    var log = $("jlog");
+    var b = el("div","jmsg "+who,"");
+    if(txt){
+      var t = el("div","jtxt","");
+      if(who === "bot" && allowHtml) t.innerHTML = txt; else t.textContent = txt;
+      b.appendChild(t);
+    }
+    if(node) b.appendChild(node);
+    log.appendChild(b);
+    log.scrollTop = log.scrollHeight;
+    if(who === "bot" && txt) speakText(txt);
+    return b;
+  }
+  function sleep(ms){ return new Promise(function(resolve){ setTimeout(resolve, ms); }); }
+  /* A reply that lands the instant you hit send reads as canned, not
+     conversational. A short, slightly randomised pause plus a typing
+     bubble gives the exchange a human beat, matched to how long a person
+     takes to skim a message and start answering. */
+  function thinkingDelay(){ return sleep(450 + Math.random()*400); }
+  function showTyping(){
+    hideTyping();
+    var log = $("jlog");
+    var b = el("div","jmsg bot","");
+    b.id = "jtypingBubble";
+    var t = el("div","jtxt typing","");
+    t.appendChild(el("span","","")); t.appendChild(el("span","","")); t.appendChild(el("span","",""));
+    b.appendChild(t);
+    log.appendChild(b);
+    log.scrollTop = log.scrollHeight;
+  }
+  function hideTyping(){
+    var b = $("jtypingBubble");
+    if(b) b.remove();
+  }
+  function botChips(list){
+    var box = $("jchips");
+    box.innerHTML = "";
+    (list || []).forEach(function(t){
+      box.appendChild(btn(t,"btn sm", function(){ botHandle(t); }));
+    });
+  }
+  function botCard(lines, confirmLabel, onConfirm, warn){
+    var c = el("div","jcard" + (warn ? " warn" : ""), "");
+    lines.forEach(function(l){
+      var r = el("div","jrow","");
+      r.appendChild(el("span","k", l[0]));
+      r.appendChild(el("span","v", l[1]));
+      c.appendChild(r);
+    });
+    if(warn) c.appendChild(el("div","jwarn", warn));
+    var acts = el("div","acts","");
+    acts.appendChild(btn(confirmLabel,"btn sm primary", function(){
+      chat.pending = null;
+      chat.draft = null;
+      chat.draftWeek = null;
+      acts.innerHTML = "";
+      acts.appendChild(el("span","chip green",t("chip_confirmed")));
+      onConfirm();
+    }));
+    acts.appendChild(btn(t("btn_cancel"),"btn sm", function(){
+      chat.pending = null;
+      chat.draft = null;
+      chat.draftWeek = null;
+      acts.innerHTML = "";
+      acts.appendChild(el("span","chip grey",t("chip_cancelled")));
+      botSay("bot",t("bot_cancelled_no_save"));
+    }));
+    c.appendChild(acts);
+    return c;
+  }
+  function nextFreeDay(){
+    for(var i=0; i<5; i++){ if(capacity(i) - dayTotal(i) > 0) return i; }
+    return -1;
+  }
+  function weekSummaryText(){
+    var errs = errors().length;
+    return t("bot_week_summary", {tot: fmt(weekTotal()), exp: fmt(weekCapacity())}) +
+      (errs ? plural(errs, "bot_week_errors_block") : t("bot_week_no_errors_submit"));
+  }
+  /* The "Receiver object" line a confirmation card shows: PEP if the
+     project carries one, the cost center otherwise - same either/or every
+     card in this file (offerEntry, offerEntryWeek, offerFillMissing,
+     offerFillMissingMonth) used to spell out on its own. */
+  function receiverObjectLabel(pr){
+    return pr.sap.rproj ? t("bot_receiver_pep", {code: pr.sap.rproj}) : t("bot_receiver_cost_center", {code: pr.sap.rkostl});
+  }
+
+  /* assistant actions, shared between Claude (via /api/chat) and the local interpreter */
+  function showAbsences(){
+    var node = el("div","jlist","");
+    ABSENCES.forEach(function(a){
+      node.appendChild(el("div","jrow2", DAYS[a.day] + " · " + a.type + " · " + fmt(a.hours) + " h · " + absStatusLabel(a.status)));
+    });
+    botSay("bot",t("bot_absences_intro"), node);
+    botChips([t("chip_hours_i_have"),t("chip_copy_last_week")]);
+  }
+  function showWeekStatus(){
+    botSay("bot", weekSummaryText());
+    botChips([t("chip_my_absences"),t("chip_submit_week")]);
+  }
+  function showHelp(){
+    botSay("bot",t("bot_help_text"), null, true);
+    botChips([t("chip_hours_i_have"),t("chip_my_absences"),t("chip_copy_last_week"),t("chip_submit_week")]);
+  }
+  function goToScreen(key, label){
+    var b = document.querySelector('.nav button[data-screen="'+key+'"]');
+    if(b) b.click();
+    botSay("bot",t("bot_switched_to", {screen: label}));
+  }
+  function goToTeamScreen(){ goToScreen("team",t("nav_team")); }
+  function goToApprovalScreen(){ goToScreen("aprov",t("nav_approval")); }
+  function goToCatsScreen(){ goToScreen("cats",t("nav_cats")); }
+  function showSuggestionsPanel(){
+    var vis = visibleSugs();
+    botSay("bot", vis.length
+      ? t("bot_suggestions_available", {n: vis.length})
+      : t("bot_no_suggestions"));
+    if(vis.length) botChips([t("chip_apply_high_conf")]);
+  }
+  function offerApplyHighConfidence(){
+    var hi = visibleSugs().filter(function(s){ return s.conf === "hi"; });
+    if(!hi.length){ botSay("bot",t("bot_no_high_conf")); return; }
+    chat.pending = "sugs";
+    botSay("bot",t("bot_confirm_apply_suggestions"), botCard(
+      hi.map(function(s){ return [DAYS[s.day] + ", " + PROJECTS[s.p].code, fmt(s.hours) + " h"]; }),
+      t("btn_apply"), function(){
+        hi.forEach(acceptSug);
+        botSay("bot", t("bot_suggestions_applied", {n: hi.length}) + weekSummaryText());
+      }));
+  }
+  function offerCopyWeek(){
+    chat.pending = "copy";
+    botSay("bot",t("bot_copy_week_offer"), botCard(
+      [[t("label_action"),t("bot_copy_rows_value")],[t("label_durations"),t("bot_stay_zero_value")]],
+      t("btn_copy"), function(){ copyWeek(); botSay("bot",t("bot_copy_week_done")); }));
+  }
+  function offerSubmit(){
+    if(state.submitted){ botSay("bot",t("bot_week_already_submitted")); return; }
+    var errs = errors();
+    if(errs.length){
+      botSay("bot",t("bot_cant_submit_yet", {reason: errs[0].txt}));
+      botChips([t("chip_hours_i_have")]);
+      return;
+    }
+    chat.pending = "submit";
+    botSay("bot",t("bot_confirm_submit_week", {num: WEEKS[weekIdx].num}), botCard(
+      [[t("th_total"),fmt(weekTotal()) + " h"],[t("label_expected"),fmt(weekCapacity()) + " h"],[t("label_status_after_submit"),t("state_in_approval")]],
+      t("btn_submit"), function(){ doSubmit(); botSay("bot",t("bot_week_submitted_msg")); }));
+  }
+  function offerEntry(day, dur, pIdx, desc){
+    var pr = PROJECTS[pIdx];
+    if(state.submitted){
+      botSay("bot", t("bot_week_locked"));
+      return;
+    }
+    var alt = null;
+    if(isBlocked(day)){
+      alt = nextFreeDay();
+      if(alt === -1){
+        botSay("bot", t("bot_day_absence_no_alt", {day: DAYS[day], type: absOn(day,"approved")[0].type.toLowerCase()}));
+        return;
+      }
+      botSay("bot", t("bot_day_absence_suggest", {day: DAYS[day], type: absOn(day,"approved")[0].type.toLowerCase(), alt: DAYS[alt]}));
+      day = alt;
+    }
+    if(!periodOpen(WORKDATES[day])){
+      botSay("bot", t("bot_day_closed", {day: DAYS[day]}));
+      return;
+    }
+    var livre = capacity(day) - dayTotal(day);
+    if(dur > livre){
+      /* Same hard rule as a manual grid cell (durCell): never let a day go
+         over capacity, not even with a warning, refuse it here instead. */
+      var abs = absOn(day, "approved")[0];
+      var capMsg = abs
+        ? t("bot_day_abs_cap", {day: DAYS[day], type: abs.type.toLowerCase()})
+        : t("bot_day_capacity", {day: DAYS[day], cap: fmt(capacity(day))});
+      botSay("bot", capMsg + (livre > 0 ? t("bot_hours_left_suffix", {left: fmt(livre)}) : t("bot_no_hours_suffix")));
+      return;
+    }
+    chat.pending = "entry";
+    chat.draft = {day:day, dur:dur, p:pIdx, desc:desc};
+    botSay("bot",t("bot_confirm_entry"), botCard([
+      [t("label_day"), DAYS[day]],
+      [t("label_duration"), fmt(dur) + " h"],
+      [t("label_project"), pr.name],
+      [t("label_receiver_object"), receiverObjectLabel(pr)],
+      [t("label_activity_type"), pr.sap.lstar + ", " + pr.act],
+      [t("label_description"), desc || t("bot_desc_tbd")],
+      [t("label_origin"), "Joule"]
+    ], t("btn_save"), function(){
+      var row = state.rows.filter(function(r){ return r.p === pIdx; })[0];
+      if(!row){ row = {id:nextId++, p:pIdx, desc:desc, h:[0,0,0,0,0,0,0], origin:"Joule"}; state.rows.push(row); }
+      if(desc) row.desc = desc;
+      row.origin = "Joule";
+      row.h[day] += dur;
+      state.needsSave = true;
+      render();
+      flashCell(row.id, day);
+      botSay("bot", t("bot_entry_saved", {dur: fmt(dur), day: DAYS[day], code: pr.code}) + weekSummaryText());
+      botChips([t("chip_submit_week"),t("chip_my_absences")]);
+    }));
+  }
+  /* Same idea as offerEntry, but for "8h RTL-TT all days this week": one
+     duration, repeated on every working day, skipping days with an approved
+     absence instead of shifting the whole request like offerEntry does for a
+     single blocked day. */
+  function offerEntryWeek(days, dur, pIdx, desc){
+    var pr = PROJECTS[pIdx];
+    if(state.submitted){
+      botSay("bot", t("bot_week_locked"));
+      return;
+    }
+    var free = days.filter(function(d){ return !isBlocked(d) && periodOpen(WORKDATES[d]); });
+    var blocked = days.filter(function(d){ return isBlocked(d); });
+    var closed = days.filter(function(d){ return !isBlocked(d) && !periodOpen(WORKDATES[d]); });
+    /* Same hard rule as offerEntry: a day that can't take the full amount
+       is left out, not just flagged, matching a manual grid cell. */
+    var over = free.filter(function(d){ return dur > capacity(d) - dayTotal(d); });
+    var applicable = free.filter(function(d){ return dur <= capacity(d) - dayTotal(d); });
+    if(!applicable.length){
+      botSay("bot",t("bot_every_day_blocked"));
+      return;
+    }
+    var skipParts = [];
+    if(blocked.length || closed.length){
+      skipParts.push(t("bot_skip_absence_closed", {days: blocked.concat(closed).map(function(d){ return DAYS[d]; }).join(", ")}));
+    }
+    if(over.length) skipParts.push(t("bot_skip_over_capacity", {days: over.map(function(d){ return DAYS[d]; }).join(", ")}));
+    var daysLabel = applicable.map(function(d){ return DAYS[d]; }).join(", ")
+      + (skipParts.length ? t("bot_days_skipped_suffix", {parts: skipParts.join("; ")}) : "");
+
+    chat.pending = "entryWeek";
+    chat.draftWeek = {days:applicable, dur:dur, p:pIdx, desc:desc};
+    botSay("bot",t("bot_confirm_entry"), botCard([
+      [t("label_days"), daysLabel],
+      [t("label_duration_per_day"), fmt(dur) + " h"],
+      [t("th_total"), fmt(dur * applicable.length) + " h"],
+      [t("label_project"), pr.name],
+      [t("label_receiver_object"), receiverObjectLabel(pr)],
+      [t("label_activity_type"), pr.sap.lstar + ", " + pr.act],
+      [t("label_description"), desc || t("bot_desc_tbd")],
+      [t("label_origin"), "Joule"]
+    ], t("btn_save"), function(){
+      var row = state.rows.filter(function(r){ return r.p === pIdx; })[0];
+      if(!row){ row = {id:nextId++, p:pIdx, desc:desc, h:[0,0,0,0,0,0,0], origin:"Joule"}; state.rows.push(row); }
+      if(desc) row.desc = desc;
+      row.origin = "Joule";
+      applicable.forEach(function(d){ row.h[d] += dur; });
+      state.needsSave = true;
+      render();
+      applicable.forEach(function(d){ flashCell(row.id, d); });
+      botSay("bot", plural(applicable.length, "bot_entry_saved_days", {dur: fmt(dur), total: fmt(dur * applicable.length), code: pr.code}) + weekSummaryText());
+      botChips([t("chip_submit_week"),t("chip_my_absences")]);
+    }));
+  }
+
+  /* "fill in my missing hours [on BNK]": the personal equivalent of
+     offerFillMissingTeam. For PT02 (weekly), scoped to the visible week
+     like every other personal chat entry (registar_horas/registar_horas_
+     semana never reach across weeks either); for PT01 (monthly), covers
+     every week touched by the visible month, the same scope the month
+     grid and its Submit already use - a person filling in a whole
+     month's gaps one week at a time would defeat the point of this
+     command.
+     "Missing" tops a day up to its own capacity, not just days sitting
+     at exactly zero: a day already at 2h of an 8h capacity still has 6h
+     missing. dur, when given, caps how much gets added to any one day
+     instead of always closing the whole gap - never more than what's
+     actually left, same hard rule as everywhere else. */
+  function offerFillMissing(pIdx, dur){
+    if(isMonthly()) return offerFillMissingMonth(pIdx, dur);
+    if(state.submitted){
+      botSay("bot", t("bot_week_locked"));
+      return;
+    }
+    var pr = PROJECTS[pIdx];
+    var plan = [0,1,2,3,4].map(function(d){
+      var gap = capacity(d) - dayTotal(d);
+      return {day:d, add: dur ? Math.min(dur, gap) : gap};
+    }).filter(function(x){ return x.add > 0; });
+    if(!plan.length){
+      botSay("bot", t("bot_week_capacity_full"));
+      botChips([t("chip_hours_i_have")]);
+      return;
+    }
+    var total = plan.reduce(function(a,x){ return a + x.add; }, 0);
+    var daysLabel = plan.map(function(x){ return DAYS[x.day] + " +" + fmt(x.add) + "h"; }).join(", ");
+    chat.pending = "entryWeek";
+    botSay("bot",t("bot_confirm_entry"), botCard([
+      [t("label_days"), daysLabel],
+      [t("th_total"), fmt(total) + " h"],
+      [t("label_project"), pr.name],
+      [t("label_receiver_object"), receiverObjectLabel(pr)],
+      [t("label_activity_type"), pr.sap.lstar + ", " + pr.act],
+      [t("label_origin"), "Joule"]
+    ], t("btn_save"), function(){
+      var row = state.rows.filter(function(r){ return r.p === pIdx; })[0];
+      if(!row){ row = {id:nextId++, p:pIdx, desc:"", h:[0,0,0,0,0,0,0], origin:"Joule"}; state.rows.push(row); }
+      row.origin = "Joule";
+      plan.forEach(function(x){ row.h[x.day] += x.add; });
+      state.needsSave = true;
+      render();
+      plan.forEach(function(x){ flashCell(row.id, x.day); });
+      botSay("bot", plural(plan.length, "bot_filled_saved", {total: fmt(total), code: pr.code}) + weekSummaryText());
+      botChips([t("chip_submit_week"),t("chip_my_absences")]);
+    }));
+  }
+  function offerFillMissingMonth(pIdx, dur){
+    var pr = PROJECTS[pIdx];
+    var plan = activeMonthDates().map(function(dateISO){
+      var wd = weekDayFor(dateISO);
+      if(!wd || wd.day > 4 || wd.week.submitted || !periodOpen(dateISO)) return null;
+      var gap = capacityOf(wd.week, wd.day) - dayTotalOf(wd.week, wd.day);
+      return gap > 0 ? {dateISO:dateISO, week:wd.week, day:wd.day, add: dur ? Math.min(dur, gap) : gap} : null;
+    }).filter(function(x){ return x; });
+    if(!plan.length){
+      botSay("bot", t("bot_month_capacity_full"));
+      botChips([t("chip_hours_i_have")]);
+      return;
+    }
+    var total = plan.reduce(function(a,x){ return a + x.add; }, 0);
+    var daysLabel = plan.map(function(x){ return monthDayLabel(x.week, x.day) + " +" + fmt(x.add) + "h"; }).join(", ");
+
+    chat.pending = "entryWeek";
+    botSay("bot",t("bot_confirm_entry"), botCard([
+      [t("label_days"), daysLabel],
+      [t("th_total"), fmt(total) + " h"],
+      [t("label_project"), pr.name],
+      [t("label_receiver_object"), receiverObjectLabel(pr)],
+      [t("label_activity_type"), pr.sap.lstar + ", " + pr.act],
+      [t("label_origin"), "Joule"]
+    ], t("btn_save"), function(){
+      plan.forEach(function(x){
+        var row = monthRowIn(x.week, pIdx);
+        if(!row){ row = {id:nextId++, p:pIdx, desc:"", h:[0,0,0,0,0,0,0], origin:"Joule"}; x.week.rows.push(row); }
+        row.origin = "Joule";
+        row.h[x.day] += x.add;
+      });
+      state.needsSave = true;
+      render();
+      var errs = monthErrors(activeMonthDates()).length;
+      botSay("bot", plural(plan.length, "bot_filled_saved_month", {total: fmt(total), code: pr.code})
+        + (errs ? plural(errs, "bot_week_errors_block") : t("bot_week_no_errors_submit")));
+      botChips([t("chip_submit_month"),t("chip_my_absences")]);
+    }));
+  }
+
+  /* asks Claude, at /api/chat, to interpret the text and choose a function.
+     Returns null on any failure (no key configured, network, engine error),
+     and in that case the caller falls back to the local regex interpreter. */
+  async function askAssistant(txt){
+    try{
+      var res = await fetch("/api/chat", {
+        method: "POST",
+        headers: {"Content-Type": "application/json"},
+        body: JSON.stringify({
+          mensagem: txt,
+          historico: chat.history.slice(0, -1).slice(-12),
+          contexto: {
+            ecra_atual: {semana:"My Timesheet", team:"Team", aprov:"Approval", cats:"CATS mapping"}[state.screen] || "My Timesheet",
+            projetos: PROJECTS.map(function(p,i){ return {codigo: p.code.split("-")[0], nome: p.name, indice: i}; }),
+            ausencias: ABSENCES.map(function(a){ return {dia: DAYS[a.day], indice: a.day, tipo: a.type, horas: a.hours, estado: a.status}; }),
+            capacidades: [0,1,2,3,4].map(function(d){ return {dia: DAYS[d], indice: d, capacidade: capacity(d), registado: dayTotal(d)}; }),
+            /* For consulting (monthly), this has to cover every week the
+               visible month touches, the same scope offerFillMissingMonth
+               actually fills - a context scoped to just the anchor week
+               would tell the assistant there's nothing to fill even when
+               other weeks in the month clearly have gaps. */
+            dias_uteis_sem_horas_pessoa: isMonthly()
+              ? activeMonthDates().filter(function(dateISO){
+                  var wd = weekDayFor(dateISO);
+                  return wd && wd.day <= 4 && !wd.week.submitted && periodOpen(dateISO)
+                    && capacityOf(wd.week, wd.day) > 0 && dayTotalOf(wd.week, wd.day) === 0;
+                }).map(function(dateISO){ var wd = weekDayFor(dateISO); return monthDayLabel(wd.week, wd.day); })
+              : [0,1,2,3,4].filter(function(d){ return capacity(d) > 0 && dayTotal(d) === 0; }).map(function(d){ return DAYS[d]; }),
+            semana: {total: weekTotal(), esperado: weekCapacity(), erros: errors().length, submetida: state.submitted},
+            semanas_anteriores: WEEKS.slice(0, weekIdx).map(function(w){
+              var porProjeto = {};
+              w.rows.forEach(function(r){
+                var tot = r.h.reduce(function(a,b){ return a+(b||0); }, 0);
+                if(!tot) return;
+                var code = PROJECTS[r.p].code.split("-")[0];
+                porProjeto[code] = (porProjeto[code] || 0) + tot;
+              });
+              return {
+                semana: w.num,
+                submetida: w.submitted,
+                projetos: Object.keys(porProjeto).map(function(c){ return {codigo:c, horas: round15(porProjeto[c])}; }),
+                ausencias: w.absences.map(function(a){ return {tipo:a.type, horas:a.hours, estado:a.status}; })
+              };
+            }),
+            projeto_equipa_ativo: (function(){
+              var p = PROJECTS[massProject()];
+              return p ? {codigo: p.code.split("-")[0], nome: p.name} : null;
+            })(),
+            projetos_do_lider: projectsOf(state.leader).map(function(i){
+              return {codigo: PROJECTS[i].code.split("-")[0], nome: PROJECTS[i].name};
+            }),
+            equipa: teamOf(state.leader).map(function(m){
+              return {
+                nome: m.name, aprovado_bloqueado: !!m.locked,
+                projetos: m.projs.map(function(i){ return PROJECTS[i].code.split("-")[0]; }),
+                dias_uteis_sem_horas: missingWeekdaysFor(m).map(function(d){ return DAYS[d]; })
+              };
+            }),
+            aprovacoes: state.approvals.map(function(a){ return {nome: a.who, tem_excecao: !!a.warn, nota: a.note || null, aprovado: !!a.approved}; }),
+            pedido_por_confirmar: chat.pending === "entry" && chat.draft
+              ? {dia: DAYS[chat.draft.day], duracao_horas: chat.draft.dur, projeto: PROJECTS[chat.draft.p].code.split("-")[0], descricao: chat.draft.desc}
+              : null
+          }
+        })
+      });
+      if(!res.ok) return null;
+      var data = await res.json();
+      if(!data || data.error) return null;
+      return data;
+    }catch(e){
+      return null;
+    }
+  }
+
+  /* Claude reads teamOf(state.leader) too (the 'equipa' list in its
+     context), scoped to whichever leader and project are currently active
+     above the Team grid - so a name it names correctly can still fail to
+     resolve here if Acting as / Project moved on since, and "couldn't
+     confirm who, the days or the hours" said nothing about which, or why.
+     This says which part is missing and, for the person specifically,
+     names the likely cause: right person, wrong Acting as / Project. */
+  function teamActionProblem(pessoaArg, hasTarget, hasDays, hasAmount, amountLabel){
+    var missing = [];
+    if(!hasTarget){
+      var name = String(pessoaArg || "").trim();
+      missing.push(name
+        ? t("bot_team_not_found", {name: name, code: PROJECTS[massProject()].code, leader: leaderById(state.leader).name})
+        : t("bot_team_who_unclear"));
+    }
+    if(!hasDays) missing.push(t("bot_team_day_unclear"));
+    if(!hasAmount) missing.push(t("bot_team_amount_unclear", {amount: amountLabel}));
+    return missing.join("; ") + ".";
+  }
+  /* Claude sends back a project code, possibly abbreviated or lowercased
+     ("bnk" for "BNK-2026"); resolves it to a PROJECTS index by matching the
+     start of the code, case-insensitively, or -1 if nothing matches.
+     registar_horas, registar_horas_semana and preencher_horas_em_falta each
+     used to run this same loop themselves. */
+  function matchProjectCodePrefix(str){
+    /* An empty needle is a prefix of every code ("anything".indexOf("")
+       === 0), so without this guard a missing/blank project argument
+       silently resolved to the LAST project in the list instead of
+       failing - Claude omitting 'projeto' then booked hours against
+       whichever project happened to be last, rather than the caller
+       correctly treating it as unresolved. */
+    var needle = String(str || "").trim().toLowerCase();
+    if(!needle) return -1;
+    var pIdx = -1;
+    PROJECTS.forEach(function(pr,i){
+      if(pr.code.toLowerCase().indexOf(needle) === 0) pIdx = i;
+    });
+    return pIdx;
+  }
+  /* maps Claude's response (function + arguments) to the same bot actions */
+  function botDispatch(intent){
+    switch(intent.funcao){
+      case "listar_ausencias": showAbsences(); return true;
+      case "consultar_semana": showWeekStatus(); return true;
+      case "aplicar_sugestoes": offerApplyHighConfidence(); return true;
+      case "ir_para_equipa": goToTeamScreen(); return true;
+      case "ir_para_aprovacao": goToApprovalScreen(); return true;
+      case "ir_para_cats": goToCatsScreen(); return true;
+      case "copiar_semana": offerCopyWeek(); return true;
+      case "submeter_semana": offerSubmit(); return true;
+      case "registar_horas_equipa":
+        var ae = intent.argumentos || {};
+        var teamMembersE = teamOf(state.leader);
+        var targetsE = /^(todos|toda a equipa|equipa toda)$/i.test(String(ae.pessoa || "").trim())
+          ? teamMembersE
+          : teamMembersE.filter(function(m){ return m.name.toLowerCase().indexOf(String(ae.pessoa || "").toLowerCase()) !== -1; });
+        var rawDaysE = Array.isArray(ae.dias) && ae.dias.length ? ae.dias : (ae.dia ? [ae.dia] : []);
+        var daysE = rawDaysE
+          .map(function(d){ return resolveDayArg(d); })
+          .filter(function(i){ return i !== -1; });
+        var clockE = null;
+        if(ae.hora_inicio && ae.hora_fim){
+          var bE = parseClock(ae.hora_inicio), eE = parseClock(ae.hora_fim);
+          if(!isNaN(bE) && bE !== null && !isNaN(eE) && eE !== null) clockE = {b:bE, e:eE};
+        }
+        var durE = clockE ? null : round15(Number(ae.duracao_horas));
+        var hasAmountE = !!(clockE || (durE && durE > 0));
+        if(!targetsE.length || !daysE.length || !hasAmountE){
+          botSay("bot", intent.texto || teamActionProblem(ae.pessoa, targetsE.length > 0, daysE.length > 0, hasAmountE, t("label_the_hours")));
+          botChips([t("chip_help")]);
+          return true;
+        }
+        offerTeamEntry(targetsE, daysE, durE, clockE);
+        return true;
+      case "preencher_horas_em_falta_equipa":
+        var fp = intent.argumentos || {};
+        var durFp = round15(Number(fp.duracao_horas));
+        offerFillMissingTeam(fp.pessoa, durFp > 0 ? durFp : 0);
+        return true;
+      case "aprovar":
+        var aa = intent.argumentos || {};
+        var isAll = /^(todos|toda a equipa|equipa toda)$/i.test(String(aa.pessoa || "").trim());
+        handleApprovalRequest(isAll ? "approve everyone" : "approve " + String(aa.pessoa || ""));
+        return true;
+      case "registar_allowance_equipa":
+        var al = intent.argumentos || {};
+        var teamMembersAl = teamOf(state.leader);
+        var targetsAl = /^(todos|toda a equipa|equipa toda)$/i.test(String(al.pessoa || "").trim())
+          ? teamMembersAl
+          : teamMembersAl.filter(function(m){ return m.name.toLowerCase().indexOf(String(al.pessoa || "").toLowerCase()) !== -1; });
+        var wAl = wt(al.rubrica);
+        var rawDaysAl = Array.isArray(al.dias) && al.dias.length ? al.dias : (al.dia ? [al.dia] : []);
+        var daysAl = rawDaysAl.map(function(d){ return resolveDayArg(d); }).filter(function(i){ return i !== -1; });
+        var qtyAl = round15(Number(al.quantidade));
+        var hasAmountAl = !!(qtyAl && qtyAl > 0);
+        if(!targetsAl.length || !wAl || !daysAl.length || !hasAmountAl){
+          var msgAl = intent.texto || teamActionProblem(al.pessoa, targetsAl.length > 0, daysAl.length > 0, hasAmountAl, t("label_the_quantity"));
+          if(!intent.texto && !wAl) msgAl += " " + t("bot_also_unrecognized_wage_type");
+          botSay("bot", msgAl);
+          botChips([t("chip_help")]);
+          return true;
+        }
+        offerTeamAllowance(targetsAl, daysAl, al.rubrica, qtyAl, String(al.nota || "").trim());
+        return true;
+      case "registar_horas":
+        var a = intent.argumentos || {};
+        var pIdx = matchProjectCodePrefix(a.projeto);
+        var dur = round15(Number(a.duracao_horas));
+        /* 'dias' (several explicit dates, e.g. "nos dias 14, 15 e 16") takes
+           priority over the single 'dia' when both somehow show up. A single
+           resolved day still goes through offerEntry, which has its own
+           "day is blocked, suggest the next free one" handling that
+           offerEntryWeek doesn't need to duplicate for the common case. */
+        var rawDays = Array.isArray(a.dias) && a.dias.length ? a.dias : (a.dia ? [a.dia] : []);
+        var days = rawDays.map(function(d){ return resolveDayArg(d); }).filter(function(i){ return i !== -1 && i <= 4; });
+        if(!days.length || pIdx === -1 || !dur || dur <= 0){
+          botSay("bot", intent.texto || t("bot_parse_failed_generic"));
+          botChips([t("chip_hours_i_have"),t("chip_my_absences")]);
+          return true;
+        }
+        if(days.length === 1) offerEntry(days[0], dur, pIdx, a.descricao || "");
+        else offerEntryWeek(days, dur, pIdx, a.descricao || "");
+        return true;
+      case "registar_horas_semana":
+        var aw = intent.argumentos || {};
+        var pIdxW = matchProjectCodePrefix(aw.projeto);
+        var durW = round15(Number(aw.duracao_horas));
+        if(pIdxW === -1 || !durW || durW <= 0){
+          botSay("bot", intent.texto || t("bot_parse_failed_generic"));
+          botChips([t("chip_hours_i_have"),t("chip_my_absences")]);
+          return true;
+        }
+        offerEntryWeek([0,1,2,3,4], durW, pIdxW, aw.descricao || "");
+        return true;
+      case "preencher_horas_em_falta":
+        var af = intent.argumentos || {};
+        var pIdxF = matchProjectCodePrefix(af.projeto);
+        if(pIdxF === -1){
+          botSay("bot", intent.texto || t("bot_which_project"));
+          botChips([t("chip_hours_i_have"),t("chip_my_absences")]);
+          return true;
+        }
+        var durF = round15(Number(af.duracao_horas));
+        offerFillMissing(pIdxF, durF > 0 ? durF : 0);
+        return true;
+      default:
+        if(intent.texto){
+          botSay("bot", intent.texto);
+          botChips([t("chip_hours_i_have"),t("chip_my_absences"),t("chip_help")]);
+          return true;
+        }
+        return false;
+    }
+  }
+
+  async function botHandle(txt){
+    if(!txt || !txt.trim()) return;
+    botSay("me", txt);
+    botChips([]);
+    chat.history.push({role:"user", content:txt});
+    showTyping();
+
+    /* A card is already open waiting for confirmation: read this message as
+       a correction to it first (checked here, ahead of Claude, so it holds
+       even when the language model isn't configured or doesn't pick up on
+       the open card from context alone). */
+    if(chat.pending === "entry" && chat.draft){
+      var fix = tryCorrectDraft(txt);
+      if(fix){
+        await thinkingDelay();
+        hideTyping();
+        offerEntry(fix.day, fix.dur, fix.p, fix.desc);
+        chat.history.push({role:"assistant", content:"Updated the pending entry: " + fmt(fix.dur) + "h, " + PROJECTS[fix.p].name + ", " + DAYS[fix.day] + "."});
+        return;
+      }
+    }
+
+    var intentP = askAssistant(txt);
+    var intent = (await Promise.all([intentP, thinkingDelay()]))[0];
+    hideTyping();
+    if(intent && botDispatch(intent)){
+      chat.history.push({role:"assistant", content: intent.texto || ("Called " + intent.funcao + ".")});
+      return;
+    }
+
+    botHandleLocal(txt);
+  }
+
+  /* local regex interpreter, used when Claude isn't configured or fails.
+     The pending-entry correction is checked earlier, in botHandle, ahead of
+     Claude, so it isn't repeated here. */
+  function botHandleLocal(txt){
+    var low = txt.toLowerCase();
+
+    /* greeting, no task in it: a short human reply, not the parsing-failure
+       message. Checked as a whole-message match so "hi, log 2h BNK today"
+       still falls through to the real parsers below. */
+    if(/^\s*(hi|hello|hey|hiya|good (morning|afternoon|evening)|ol[aá]|oi|bom dia|boa tarde|boa noite)[!.,\s]*$/i.test(txt)){
+      var greetings = [t("bot_greeting_1"), t("bot_greeting_2"), t("bot_greeting_3")];
+      botSay("bot", greetings[Math.floor(Math.random()*greetings.length)]);
+      botChips([t("chip_hours_i_have"),t("chip_my_absences"),t("chip_help")]);
+      return;
+    }
+    /* help */
+    if(/\bhelp\b|what can you do|what do you do|how does this work/.test(low)){ showHelp(); return; }
+    /* absences */
+    if(/absen|vacation|holiday|leave|time off/.test(low)){ showAbsences(); return; }
+    /* week status */
+    if(/how many hours|week status|status|summary|how('| i)?s (the week|it going)|check (the|my) week/.test(low)){ showWeekStatus(); return; }
+    /* suggestions */
+    if(/suggest/.test(low) && !/high.confidence/.test(low)){ showSuggestionsPanel(); return; }
+    if(/high.confidence/.test(low)){ offerApplyHighConfidence(); return; }
+    /* copy week */
+    if(/copy|last week|previous week/.test(low)){ offerCopyWeek(); return; }
+    /* submit */
+    if(/submit|send the week|close the week/.test(low)){ offerSubmit(); return; }
+    /* screen navigation */
+    if(/mass entry|team entry|team screen|go to team|switch to team|open team/.test(low)){ goToTeamScreen(); return; }
+    if(/approval screen|go to approval|switch to approval|open approval/.test(low)){ goToApprovalScreen(); return; }
+    if(/cats mapping|cats screen|go to cats|switch to cats|open cats/.test(low)){ goToCatsScreen(); return; }
+
+    /* approve a timesheet, or the whole clean batch, from the Approval
+       screen's data, checked ahead of the self-entry parser since "approve"
+       never means a time entry */
+    if(/\bapprove\b/.test(low)){ handleApprovalRequest(txt); return; }
+
+    /* log hours or an allowance for someone else's team, checked ahead of
+       the self-entry and whole-week parsers since a named target should
+       never be read as an entry for the person typing. Allowance first,
+       since a distinctive wage-type word ("per diem", "km") is a much
+       safer signal than the bare-number fallback the hours parser falls
+       back to, which would otherwise misread "2 km" as "2 hours". */
+    var teamMembers = teamOf(state.leader);
+    var ta = botParseTeamAllowance(txt, teamMembers);
+    if(ta){ offerTeamAllowance(ta.members, ta.days, ta.code, ta.qty, ta.note); return; }
+
+    var tp = botParseTeamHours(txt, teamMembers);
+    if(tp){ offerTeamEntry(tp.members, tp.days, tp.dur, tp.clock); return; }
+
+    /* a request for every working day ("8h RTL-TT all days this week"),
+       checked ahead of the single-day parser since it matches a duration
+       and a project too and would otherwise just default to "today" */
+    if(ALL_WEEK_RE.test(low)){
+      var pw = botParseWeek(txt);
+      if(pw){
+        offerEntryWeek(pw.days, pw.dur, pw.p, pw.desc);
+        chat.history.push({role:"assistant", content:"Proposed " + fmt(pw.dur) + "h/day, " + PROJECTS[pw.p].name + ", every working day this week. Waiting for confirmation."});
+        return;
+      }
+    }
+
+    /* time entry, reuses the same parser as quick add */
+    var p = botParse(txt);
+    if(!p){
+      botSay("bot",t("bot_parse_failed"), null, true);
+      botChips([t("chip_hours_i_have"),t("chip_my_absences"),t("chip_help")]);
+      chat.history.push({role:"assistant", content:"Couldn't parse a duration and project from that message."});
+      return;
+    }
+    offerEntry(p.day, p.dur, p.p, p.desc);
+    chat.history.push({role:"assistant", content:"Proposed an entry: " + fmt(p.dur) + "h, " + PROJECTS[p.p].name + ", " + DAYS[p.day] + ". Waiting for confirmation."});
+  }
+
+  /* Weekday names and "yesterday"/"today" only cover a relative reading of
+     the visible week. A calendar date ("September 15", "15 Sep", "15/09")
+     needs to be matched against WORKDATES instead. Returns the day index if
+     the date falls in the visible week, -1 if it's a real date outside it,
+     or null if nothing date-shaped was found at all. */
+  var MONTHS_NLP = ["january","february","march","april","may","june","july","august","september","october","november","december"];
+  /* Finds the WORKDATES index whose day-of-month matches dd, and whose
+     month matches mm when mm is given; -1 when nothing in the visible week
+     fits. parseDateMention, resolveDayArg and matchDaysMention each used
+     to run this same loop with their own slightly different copy. */
+  function workdateIndexFor(dd, mm){
+    for(var i=0; i<WORKDATES.length; i++){
+      if(+WORKDATES[i].slice(6,8) === dd && (mm == null || +WORKDATES[i].slice(4,6) === mm)) return i;
+    }
+    return -1;
+  }
+  function parseDateMention(rest){
+    var m, dd, mm;
+    if((m = rest.match(/\b(\d{1,2})[\/\-](\d{1,2})\b/))){ dd = +m[1]; mm = +m[2]; }
+    else if((m = rest.match(new RegExp("\\b("+MONTHS_NLP.join("|")+")\\s+(\\d{1,2})\\b","i")))){ mm = MONTHS_NLP.indexOf(m[1].toLowerCase())+1; dd = +m[2]; }
+    else if((m = rest.match(new RegExp("\\b(\\d{1,2})\\s+("+MONTHS_NLP.join("|")+")\\b","i")))){ dd = +m[1]; mm = MONTHS_NLP.indexOf(m[2].toLowerCase())+1; }
+    else return null;
+    return {day: workdateIndexFor(dd, mm), match:m[0]};
+  }
+
+  /* Resolves a day argument coming back from Claude's tool call, which isn't
+     always the clean YYYY-MM-DD the tool schema asks for (a bare "15", a
+     "2026-9-15" with unpadded month, "15/09"). Tries, in order: exact ISO
+     match against WORKDATES, a calendar-date mention via parseDateMention,
+     then a bare day-of-month number against the visible week. Returns -1
+     when nothing in the visible week matches. */
+  function resolveDayArg(dia){
+    var s = String(dia == null ? "" : dia).trim();
+    if(!s) return -1;
+    var digits = s.replace(/[-\/]/g,"");
+    var idx = WORKDATES.indexOf(digits);
+    if(idx !== -1) return idx;
+    var dm = parseDateMention(" " + s + " ");
+    if(dm && dm.day !== -1) return dm.day;
+    var bare = s.match(/^(\d{1,2})$/);
+    if(bare) return workdateIndexFor(+bare[1]);
+    return -1;
+  }
+
+  /* Duration token: "8h", "8 hours", "1:30", "90m" or a bare number, matched
+     as a WHOLE token so nothing leaks into the description afterwards — the
+     bare "h" pattern used to match only "8 h" out of "8 hours" and leave
+     "ours" behind in the text. */
+  function matchDuration(rest){
+    var m;
+    if((m = rest.match(/(\d+(?:[.,]\d+)?)\s*h(?:ours?|rs?)?\b/i))) return {dur:parseDur(m[1]), match:m[0]};
+    if((m = rest.match(/(\d{1,2}):(\d{2})\b/))) return {dur:parseDur(m[0]), match:m[0]};
+    if((m = rest.match(/(\d+)\s*m(?:in(?:ute)?s?)?\b/i))) return {dur:parseDur(m[1]+"m"), match:m[0]};
+    if((m = rest.match(/\s(\d+(?:[.,]\d+)?)\s/))) return {dur:parseDur(m[1]), match:m[0]};
+    return null;
+  }
+  /* Project code, plus any WBS suffix attached to it ("RTL-TT.2.1"), so that
+     doesn't leak into the description either. */
+  function matchProject(rest){
+    var found = null;
+    PROJECTS.forEach(function(pr,i){
+      var key = pr.code.split("-")[0];
+      var m = rest.match(new RegExp("\\b"+key+"[\\w.\\-]*","i"));
+      if(m) found = {p:i, match:m[0]};
+    });
+    return found;
+  }
+  var ALL_WEEK_RE = /\ball\s+days?\b|\bevery\s+day\b|\beach\s+day\b|\ball\s+week\b|\bwhole\s+week\b|\bfor\s+the\s+week\b/i;
+
+  /* Weekday token, "yesterday"/"today", or a calendar date, whichever is
+     found first. Returns null (no mention at all, caller keeps its own
+     default) or {day, match}, where day is -1 for a real date outside the
+     visible week, a signal the caller should treat as "can't place this". */
+  function matchDayMention(rest){
+    var m;
+    if((m = rest.match(/\byesterday\b/i))) return {day:1, match:m[0]};
+    if((m = rest.match(/\btoday\b/i))) return {day:2, match:m[0]};
+    var names = ["monday","tuesday","wednesday","thursday","friday","saturday","sunday"];
+    for(var i=0; i<names.length; i++){
+      var re = new RegExp("\\b("+names[i]+")\\b","i");
+      if((m = rest.match(re))) return {day:i, match:m[0]};
+    }
+    var dmDate = parseDateMention(rest);
+    if(dmDate) return dmDate;
+    return null;
+  }
+
+  /* assistant parser: duration, day and project */
+  function botParse(txt){
+    var rest = " " + txt + " ";
+    var dm = matchDuration(rest);
+    if(!dm || dm.dur <= 0) return null;
+    rest = rest.replace(dm.match," ");
+
+    var day = 2;
+    var dayM = matchDayMention(rest);
+    if(dayM){
+      if(dayM.day === -1) return null;
+      day = dayM.day;
+      rest = rest.replace(dayM.match," ");
+    }
+    var pm = matchProject(rest);
+    if(!pm) return null;
+    rest = rest.replace(pm.match," ");
+    return {dur:round15(dm.dur), day:day, p:pm.p, desc:rest.replace(/\s+/g," ").trim()};
+  }
+
+  /* "log 8h for João today" / "record 4h for everyone tomorrow": a mass
+     entry made through the assistant instead of the Team screen's own
+     form. Only fires when a colleague's name or "everyone"/"the team" is
+     explicitly present, so a normal self-entry never gets misread as one. */
+  function matchTeamTargets(rest, members){
+    var m = rest.match(/\bfor\s+(everyone|the\s+whole\s+team|the\s+team|all)\b/i);
+    if(m) return {list:members, match:m[0]};
+    for(var i=0; i<members.length; i++){
+      var first = members[i].name.split(" ")[0];
+      var re = new RegExp("\\bfor\\s+(the\\s+)?"+first+"\\b","i");
+      if((m = rest.match(re))) return {list:[members[i]], match:m[0]};
+    }
+    return null;
+  }
+  /* "from 08:00 till 14:00" / "08:00 to 14h00": a clock window, for
+     Z_BSRV people, read before falling back to a plain duration so it
+     isn't misread as one (a bare "08:00" would otherwise parse as an
+     8-hour duration through matchDuration's H:MM pattern). */
+  function matchClockRange(rest){
+    var m = rest.match(/\bfrom\s+(\d{1,2}(?:[:.h]\d{2})?)\s*(?:to|till|until|-|–)\s*(\d{1,2}(?:[:.h]\d{2})?)\b/i);
+    if(!m) return null;
+    var b = parseClock(m[1]), e = parseClock(m[2]);
+    if(b === null || e === null || isNaN(b) || isNaN(e)) return null;
+    return {b:b, e:e, match:m[0]};
+  }
+
+  /* "September 16, 17 and 18" / "Monday, Tuesday and Wednesday": more than
+     one day in the same request. Falls back to matchDayMention (single
+     day, or today by default) when no list is found. */
+  function matchDaysMention(rest){
+    var monthListRe = new RegExp("\\b("+MONTHS_NLP.join("|")+")\\s+(\\d{1,2}(?:\\s*(?:,|and)\\s*\\d{1,2})*)\\b","i");
+    var mm = rest.match(monthListRe);
+    if(mm){
+      var month = MONTHS_NLP.indexOf(mm[1].toLowerCase())+1;
+      var nums = mm[2].match(/\d{1,2}/g).map(Number);
+      var days = [];
+      nums.forEach(function(dd){
+        var i = workdateIndexFor(dd, month);
+        if(i !== -1) days.push(i);
+      });
+      if(days.length) return {days:days};
+    }
+    var names = ["monday","tuesday","wednesday","thursday","friday","saturday","sunday"];
+    var found = [];
+    names.forEach(function(n,i){
+      var re = new RegExp("\\b"+n+"\\b","gi"), m2;
+      while((m2 = re.exec(rest))) found.push({i:i, idx:m2.index});
+    });
+    if(found.length){
+      found.sort(function(a,b){ return a.idx - b.idx; });
+      var seen = {}, days2 = [];
+      found.forEach(function(f){ if(!seen[f.i]){ seen[f.i] = true; days2.push(f.i); } });
+      return {days:days2};
+    }
+    var single = matchDayMention(rest);
+    if(single) return single.day === -1 ? {invalid:true} : {days:[single.day]};
+    return null;
+  }
+
+  function botParseTeamHours(txt, members){
+    var rest = " " + txt + " ";
+    var clock = matchClockRange(rest);
+    var dm = null;
+    if(clock){ rest = rest.replace(clock.match," "); }
+    else {
+      dm = matchDuration(rest);
+      if(!dm || dm.dur <= 0) return null;
+      rest = rest.replace(dm.match," ");
+    }
+
+    var tgt = matchTeamTargets(rest, members);
+    if(!tgt) return null;
+    rest = rest.replace(tgt.match," ");
+
+    var dmn = matchDaysMention(rest);
+    if(dmn && dmn.invalid) return null;
+    var days = dmn ? dmn.days : [2];
+    return {members:tgt.list, days:days, dur: clock ? null : round15(dm.dur), clock:clock};
+  }
+
+  /* Drives the same form the Team screen's "Fill several people at once"
+     panel uses (project, duration or start/end, day checkboxes, then
+     Apply and Save), so a chat-staged entry goes through exactly the same
+     validation as a manually staged one, mixed clock/duration teams and
+     absences/closed periods included, instead of a second copy of that
+     logic that could drift from the real one. */
+  function offerTeamEntry(members, days, dur, clock){
+    var pIdx = massProject();
+    var pr = PROJECTS[pIdx];
+    var locked = members.filter(function(m){ return m.locked; });
+    var selected = members.filter(function(m){ return !m.locked; });
+    if(!selected.length){
+      botSay("bot",t("bot_cant_stage", {list: locked.map(function(m){ return t("bot_week_already_approved", {name: m.name.split(" ")[0]}); }).join(", ")}));
+      botChips([t("chip_hours_i_have"),t("chip_help")]);
+      return;
+    }
+    var dayLabel = days.map(function(d){ return DAYS[d]; }).join(", ");
+    var amountLabel = clock ? (fmtClock(clock.b) + "–" + fmtClock(clock.e)) : (fmt(dur) + " h");
+    var lines = [
+      [t("label_people"), selected.map(function(m){ return m.name; }).join(", ")],
+      [t("label_days"), dayLabel],
+      [clock ? t("label_time") : t("label_duration_each"), amountLabel],
+      [t("label_project"), pr.name]
+    ];
+    if(locked.length) lines.push([t("label_skipped"), locked.map(function(m){ return t("bot_week_already_approved", {name: m.name.split(" ")[0]}); }).join(", ")]);
+    botSay("bot",t("bot_confirm_register_staging"), botCard(lines, t("btn_register"), function(){
+      teamOf(state.leader).forEach(function(m){ stagedOf(m.pernr).sel = false; });
+      selected.forEach(function(m){ stagedOf(m.pernr).sel = true; });
+      if($("mDur")) $("mDur").value = clock ? "" : String(dur);
+      if($("mBeg")) $("mBeg").value = clock ? fmtClock(clock.b) : "";
+      if($("mEnd")) $("mEnd").value = clock ? fmtClock(clock.e) : "";
+      Array.prototype.forEach.call(document.querySelectorAll(".mHoursDays input"), function(c){
+        c.checked = days.indexOf(+c.value) !== -1;
+      });
+      var beforeLog = state.massLog.length;
+      applyMass();
+      saveMass(selected.map(function(m){ return m.pernr; }));
+      var savedPernrs = {};
+      state.massLog.slice(beforeLog).forEach(function(e){ savedPernrs[e.pernr] = true; });
+      var saved = selected.filter(function(m){ return savedPernrs[m.pernr]; }).map(function(m){ return m.name.split(" ")[0]; });
+      var notSaved = selected.filter(function(m){ return !savedPernrs[m.pernr]; }).map(function(m){ return m.name.split(" ")[0]; });
+      var msg = saved.length
+        ? t("bot_staged_saved", {names: saved.join(", "), days: dayLabel, code: pr.code, save: t("btn_save")})
+        : t("bot_staged_nothing");
+      if(notSaved.length) msg += t("bot_staged_not_saved_suffix", {names: notSaved.join(", "), code: pr.code});
+      botSay("bot", msg);
+      botChips([t("chip_hours_i_have"),t("chip_help")]);
+    }));
+    chat.history.push({role:"assistant", content:"Proposed " + amountLabel + " on " + dayLabel + " for " + selected.map(function(m){return m.name;}).join(", ") + ". Waiting for confirmation."});
+  }
+
+  /* "a per diem for João today" / "2 km for everyone Mon and Tue": the same
+     mass-entry idea as offerTeamEntry, but for allowances, driving the Team
+     screen's own Allowances form (#mAllowCode/#mAllowQty/#mAllowNote/
+     .mAllowDays) and its real applyMassAllow()/saveMassAllow(), so mixed
+     companies, missing required notes and closed periods are handled the
+     same way a person clicking through the screen would hit them. */
+  var ALLOWANCE_TYPES = [
+    {code:"AJC_INT", re:/\bforeign\s*per\s*diem\b/i},
+    {code:"AJC_NAC", re:/\bper\s*diem\b|\bdaily\s*allowance\b/i},
+    {code:"KMS", re:/\bkil?ometh?res?\b|\bkilometers?\b|\bkms?\b|\bmileage\b/i},
+    {code:"TURNO", re:/\bshift\s*allowance\b|\bshift\b/i}
+  ];
+  function matchAllowanceType(rest){
+    for(var i=0; i<ALLOWANCE_TYPES.length; i++){
+      var m = rest.match(ALLOWANCE_TYPES[i].re);
+      if(m) return {code:ALLOWANCE_TYPES[i].code, match:m[0]};
+    }
+    return null;
+  }
+  function matchQty(rest){
+    var m;
+    if((m = rest.match(/(\d+(?:[.,]\d+)?)\s*(?:km|kilometres?|kilometers?)\b/i))) return {qty:parseDur(m[1]), match:m[0]};
+    if((m = rest.match(/(\d+(?:[.,]\d+)?)\s*days?\b/i))) return {qty:parseDur(m[1]), match:m[0]};
+    if((m = rest.match(/\s(\d+(?:[.,]\d+)?)\s/))) return {qty:parseDur(m[1]), match:m[0]};
+    return null;
+  }
+  function botParseTeamAllowance(txt, members){
+    var rest = " " + txt + " ";
+    var typ = matchAllowanceType(rest);
+    if(!typ) return null;
+    rest = rest.replace(typ.match," ");
+
+    var tgt = matchTeamTargets(rest, members);
+    if(!tgt) return null;
+    rest = rest.replace(tgt.match," ");
+
+    var qm = matchQty(rest);
+    var qty = qm ? round15(qm.qty) : 1;
+    if(qm) rest = rest.replace(qm.match," ");
+
+    var dmn = matchDaysMention(rest);
+    if(dmn && dmn.invalid) return null;
+    var days = dmn ? dmn.days : [2];
+
+    /* Whatever's left after type/target/qty could be a real note (KMS's
+       "Lisbon to Porto", AJC_INT's country) or just filler ("log", "today",
+       a leftover weekday) the day parsing above didn't consume since, unlike
+       the other matchers, matchDaysMention doesn't report back what it
+       matched. Strip the usual filler so a bare "log today" doesn't get
+       mistaken for a genuine note and skip the required-field check below. */
+    var weekdayNames = ["monday","tuesday","wednesday","thursday","friday","saturday","sunday"];
+    var note = rest
+      .replace(/\b(log|record|add|please|stage|enter|on|this|the)\b/gi," ")
+      .replace(/\b(today|yesterday)\b/gi," ")
+      .replace(new RegExp("\\b("+weekdayNames.join("|")+")\\b","gi")," ")
+      .replace(new RegExp("\\b("+MONTHS_NLP.join("|")+")\\b","gi")," ")
+      .replace(/\b\d{1,2}\b/g," ")
+      .replace(/^[\s,]+|[\s,]+$/g,"")
+      .replace(/\s+/g," ")
+      .trim();
+
+    return {members:tgt.list, days:days, code:typ.code, qty:qty, note:note};
+  }
+  function offerTeamAllowance(members, days, code, qty, note){
+    var w = wt(code);
+    var locked = members.filter(function(m){ return m.locked; });
+    var selected = members.filter(function(m){ return !m.locked; });
+    if(!selected.length){
+      botSay("bot",t("bot_cant_stage", {list: locked.map(function(m){ return t("bot_week_already_approved", {name: m.name.split(" ")[0]}); }).join(", ")}));
+      botChips([t("chip_help")]);
+      return;
+    }
+    if(w.noteLabel && !note){
+      botSay("bot", t("bot_note_required", {noteLabel: w.noteLabel, name: w.name}));
+      botChips([t("chip_help")]);
+      return;
+    }
+    var dayLabel = days.map(function(d){ return DAYS[d]; }).join(", ");
+    var lines = [
+      [t("label_people"), selected.map(function(m){ return m.name; }).join(", ")],
+      [t("label_days"), dayLabel],
+      [t("label_wage_type"), w.name],
+      [t("label_quantity_each"), fmt(qty) + " " + w.unit]
+    ];
+    if(note) lines.push([w.noteLabel || t("label_note"), note]);
+    if(locked.length) lines.push([t("label_skipped"), locked.map(function(m){ return t("bot_week_already_approved", {name: m.name.split(" ")[0]}); }).join(", ")]);
+    botSay("bot",t("bot_confirm_register_staging"), botCard(lines, t("btn_register"), function(){
+      teamOf(state.leader).forEach(function(m){ stagedOf(m.pernr).sel = false; });
+      selected.forEach(function(m){ stagedOf(m.pernr).sel = true; });
+      if($("mAllowCode")){ $("mAllowCode").value = code; syncMassAllowForm(); }
+      if($("mAllowQty")) $("mAllowQty").value = String(qty);
+      if($("mAllowNote")) $("mAllowNote").value = note || "";
+      Array.prototype.forEach.call(document.querySelectorAll(".mAllowDays input"), function(c){
+        c.checked = days.indexOf(+c.value) !== -1;
+      });
+      var beforeLog = state.massLog.length;
+      applyMassAllow();
+      saveMassAllow(selected.map(function(m){ return m.pernr; }));
+      var savedPernrs = {};
+      state.massLog.slice(beforeLog).forEach(function(e){ savedPernrs[e.pernr] = true; });
+      var saved = selected.filter(function(m){ return savedPernrs[m.pernr]; }).map(function(m){ return m.name.split(" ")[0]; });
+      var notSaved = selected.filter(function(m){ return !savedPernrs[m.pernr]; }).map(function(m){ return m.name.split(" ")[0]; });
+      var msg = saved.length
+        ? t("bot_staged_saved_allow", {names: saved.join(", "), days: dayLabel, name: w.name, save: t("btn_save")})
+        : t("bot_staged_nothing");
+      if(notSaved.length) msg += t("bot_staged_not_saved_allow_suffix", {names: notSaved.join(", "), code: PROJECTS[massProject()].code});
+      botSay("bot", msg);
+      botChips([t("chip_hours_i_have"),t("chip_help")]);
+    }));
+    chat.history.push({role:"assistant", content:"Proposed " + fmt(qty) + " " + w.unit + " " + w.name + " on " + dayLabel + " for " + selected.map(function(m){return m.name;}).join(", ") + ". Waiting for confirmation."});
+  }
+
+  /* "fill in whoever's missing hours" / "complete the team's week": unlike
+     every other mass entry, this one can't share a single day set across
+     everyone, since each person's gaps are their own. Computes
+     missingWeekdaysFor()/teamGapFor() per person, so someone on Tue and
+     Wed alone doesn't also get filled on Thu just because a teammate was
+     free then, and each day is topped up to that person's own capacity
+     rather than always the same flat amount. dur, when given, caps how
+     much gets added to any one day instead of always closing the whole
+     gap - never more than what's actually left, same hard rule as
+     everywhere else. */
+  function offerFillMissingTeam(pessoaArg, dur){
+    var members = teamOf(state.leader).filter(function(m){ return !m.locked; });
+    var name = String(pessoaArg || "").trim().toLowerCase();
+    var matched = name ? members.filter(function(m){ return m.name.toLowerCase().indexOf(name) !== -1; }) : members;
+    var plan = matched.map(function(m){
+      var days = missingWeekdaysFor(m).map(function(d){
+        var gap = teamGapFor(m, d);
+        return {day:d, add: dur ? Math.min(dur, gap) : gap};
+      });
+      return {member:m, days:days};
+    }).filter(function(p){ return p.days.length; });
+    if(!plan.length){
+      var msg;
+      if(!name) msg = t("bot_team_nobody_missing", {code: PROJECTS[massProject()].code});
+      else if(matched.length) msg = t("bot_team_already_full", {names: matched.map(function(m){ return m.name; }).join(", "), code: PROJECTS[massProject()].code});
+      else msg = t("bot_team_person_not_found", {name: pessoaArg, code: PROJECTS[massProject()].code});
+      botSay("bot", msg);
+      botChips([t("chip_help")]);
+      return;
+    }
+    var lines = plan.map(function(p){
+      return [p.member.name, p.days.map(function(x){ return DAYS[x.day] + " +" + fmt(x.add) + "h"; }).join(", ")];
+    });
+    lines.push([t("label_project"), PROJECTS[massProject()].code]);
+    var total = plan.reduce(function(a,p){ return a + p.days.reduce(function(b,x){ return b+x.add; }, 0); }, 0);
+    lines.push([t("th_total"), fmt(total) + " h"]);
+    botSay("bot", t("bot_confirm_fill_team"), botCard(lines, t("btn_fill_and_register"), function(){
+      teamOf(state.leader).forEach(function(m){ stagedOf(m.pernr).sel = false; });
+      plan.forEach(function(p){
+        var st = stagedOf(p.member.pernr);
+        st.sel = true;
+        var clock = profileFor(WORKDATES[0], p.member.bukrs).clock;
+        p.days.forEach(function(x){
+          var newTotal = (st.h[x.day] || 0) + x.add;
+          if(clock){
+            var startMin = parseClock("09:00");
+            var win = {b:startMin, e:startMin + newTotal*60 + LUNCH_MIN};
+            st.t[x.day] = win; st.h[x.day] = slotHours(win);
+          } else {
+            st.t[x.day] = null; st.h[x.day] = newTotal;
+          }
+        });
+      });
+      var beforeLog = state.massLog.length;
+      saveMass(plan.map(function(p){ return p.member.pernr; }));
+      var savedPernrs = {};
+      state.massLog.slice(beforeLog).forEach(function(e){ savedPernrs[e.pernr] = true; });
+      var saved = plan.filter(function(p){ return savedPernrs[p.member.pernr]; }).map(function(p){ return p.member.name.split(" ")[0]; });
+      var notSaved = plan.filter(function(p){ return !savedPernrs[p.member.pernr]; }).map(function(p){ return p.member.name.split(" ")[0]; });
+      var msg = saved.length
+        ? t("bot_team_filled_saved", {names: saved.join(", "), save: t("btn_save")})
+        : t("bot_team_filled_nothing");
+      if(notSaved.length) msg += t("bot_team_filled_not_saved_suffix", {names: notSaved.join(", ")});
+      botSay("bot", msg);
+      botChips([t("chip_help")]);
+    }));
+    chat.history.push({role:"assistant", content:"Proposto preencher " + fmt(total) + "h em dias em falta para " + plan.map(function(p){return p.member.name;}).join(", ") + ". Aguardando confirmação."});
+  }
+
+  /* "approve João" / "approve everyone": mirrors exactly what the Approval
+     screen's own checkboxes + Approve button do, never more, so an
+     exception still can't be bulk-approved through the assistant either. */
+  function matchApprovalTargets(txt){
+    var t = txt.toLowerCase();
+    if(/\b(everyone|the\s+whole\s+team|the\s+team|all)\b/.test(t)) return {all:true};
+    var found = null;
+    state.approvals.forEach(function(a){
+      if(t.indexOf(a.who.split(" ")[0].toLowerCase()) !== -1) found = a;
+    });
+    return found ? {one:found} : null;
+  }
+  function handleApprovalRequest(txt){
+    var tgt = matchApprovalTargets(txt);
+    if(!tgt){
+      botSay("bot",t("bot_approval_ask_who"));
+      botChips([t("chip_help")]);
+      return;
+    }
+    if(tgt.all){
+      var clean = state.approvals.filter(function(a){ return !a.warn && !a.approved; });
+      if(!clean.length){
+        botSay("bot",t("bot_approval_nothing"));
+        return;
+      }
+      botSay("bot",t("bot_confirm_approve_all", {n: clean.length}), botCard(
+        clean.map(function(a){ return [a.who, fmt(a.tot) + " h"]; }),
+        t("btn_approve_all"), function(){
+          clean.forEach(function(a){ a.approved = true; a.sel = false; });
+          renderApprovals();
+          botSay("bot", t("bot_approved_all_msg", {n: clean.length}));
+          botChips([t("chip_help")]);
+        }
+      ));
+      return;
+    }
+    var a = tgt.one;
+    if(a.approved){ botSay("bot", t("bot_already_approved", {name: a.who})); return; }
+    if(a.warn){
+      botSay("bot", t("bot_has_exception", {name: a.who, note: a.note}));
+      return;
+    }
+    botSay("bot",t("bot_confirm_approve_one", {name: a.who}), botCard([
+      [t("label_project"), a.proj], [t("th_total"), fmt(a.tot) + " h"], [t("label_in_project"), fmt(a.inproj) + " h"]
+    ], t("btn_approve"), function(){
+      a.approved = true; a.sel = false;
+      renderApprovals();
+      botSay("bot", t("bot_approved_one_msg", {name: a.who}));
+      botChips([t("chip_help")]);
+    }));
+  }
+
+  /* Same reading as botParse, but for a request meant to repeat across every
+     working day of the visible week ("8h RTL-TT all days this week"),
+     instead of the one day botParse would default to. */
+  function botParseWeek(txt){
+    var rest = " " + txt + " ";
+    var dm = matchDuration(rest);
+    if(!dm || dm.dur <= 0) return null;
+    rest = rest.replace(dm.match," ").replace(ALL_WEEK_RE," ").replace(/\bthis\s+week\b|\bthe\s+week\b/gi," ");
+    var pm = matchProject(rest);
+    if(!pm) return null;
+    rest = rest.replace(pm.match," ");
+    return {dur:round15(dm.dur), days:[0,1,2,3,4], p:pm.p, desc:rest.replace(/\s+/g," ").trim()};
+  }
+
+  /* A card is already open for chat.draft: read this message for just the
+     part that changes (a different day, duration or project), and keep the
+     rest of the draft as it was, instead of demanding the whole sentence
+     again. Returns null if nothing recognizable was found, so the caller can
+     fall through to every other interpretation. Duration deliberately skips
+     the bare-number fallback matchDuration has for a fresh request: on a
+     short correction like "actually September 16", that fallback would
+     misread the "16" as a duration instead of leaving it to the date match. */
+  function tryCorrectDraft(txt){
+    var rest = " " + txt + " ", m;
+    var draft = chat.draft, day = draft.day, dur = draft.dur, pIdx = draft.p, changed = false;
+
+    if(/\byesterday\b/i.test(rest)){ day = 1; changed = true; rest = rest.replace(/\byesterday\b/i," "); }
+    else if(/\btoday\b/i.test(rest)){ day = 2; changed = true; rest = rest.replace(/\btoday\b/i," "); }
+    else {
+      var names = ["monday","tuesday","wednesday","thursday","friday","saturday","sunday"];
+      for(var i=0; i<names.length && !changed; i++){
+        var re = new RegExp("\\b("+names[i]+")\\b","i");
+        if(re.test(rest)){ day = i; changed = true; rest = rest.replace(re," "); }
+      }
+      if(!changed){
+        var dm = parseDateMention(rest);
+        if(dm && dm.day !== -1){ day = dm.day; changed = true; rest = rest.replace(dm.match," "); }
+      }
+    }
+
+    if((m = rest.match(/(\d+(?:[.,]\d+)?)\s*h(?:ours?|rs?)?\b/i))){ dur = parseDur(m[1]); changed = true; }
+    else if((m = rest.match(/(\d{1,2}):(\d{2})\b/))){ dur = parseDur(m[0]); changed = true; }
+    else if((m = rest.match(/(\d+)\s*m(?:in(?:ute)?s?)?\b/i))){ dur = parseDur(m[1]+"m"); changed = true; }
+
+    var pm = matchProject(rest);
+    if(pm){ pIdx = pm.p; changed = true; }
+
+    if(!changed) return null;
+    return {day:day, dur:round15(dur), p:pIdx, desc:draft.desc};
+  }
+
+  $("jouleFab").onclick = function(){ botToggle(); };
+  $("jClose").onclick = function(){ botToggle(false); };
+  $("jform").onsubmit = function(ev){
+    ev.preventDefault();
+    if(chat.busy) return;
+    var v = $("jinput").value.trim();
+    if(!v) return;
+    $("jinput").value = "";
+    voice.speakReply = voice.usedVoice;
+    voice.usedVoice = false;
+    chat.busy = true;
+    $("jinput").disabled = true;
+    if($("jsend")) $("jsend").disabled = true;
+    botHandle(v).finally(function(){
+      voice.speakReply = false;
+      chat.busy = false;
+      $("jinput").disabled = false;
+      if($("jsend")) $("jsend").disabled = false;
+      $("jinput").focus();
+    });
+  };
+
+  (function setupVoiceInput(){
+    var micBtn = $("jMic"), langBtn = $("jMicLang");
+    if(!micBtn || !langBtn) return;
+    var SR = window.SpeechRecognition || window.webkitSpeechRecognition;
+    if(!SR){
+      micBtn.disabled = true;
+      langBtn.disabled = true;
+      micBtn.title = t("voice_not_supported");
+      return;
+    }
+    function nextLang(l){ return VOICE_LANG_ORDER[(VOICE_LANG_ORDER.indexOf(l) + 1) % VOICE_LANG_ORDER.length]; }
+    function updateLangBtn(){
+      langBtn.textContent = voice.lang;
+      langBtn.title = "Voice input language: " + VOICE_LANG_NAMES[voice.lang] + " (click to switch to " + VOICE_LANG_NAMES[nextLang(voice.lang)] + ")";
+    }
+    updateLangBtn();
+    langBtn.onclick = function(){
+      voice.lang = nextLang(voice.lang);
+      updateLangBtn();
+    };
+
+    var recog = new SR();
+    recog.continuous = false;
+    recog.interimResults = true;
+    var listening = false;
+
+    function stopUI(){
+      listening = false;
+      micBtn.classList.remove("listening");
+    }
+    recog.onresult = function(ev){
+      var text = "";
+      for(var i = 0; i < ev.results.length; i++) text += ev.results[i][0].transcript;
+      $("jinput").value = text;
+      voice.usedVoice = true;
+    };
+    recog.onerror = function(ev){
+      stopUI();
+      if(ev.error !== "no-speech" && ev.error !== "aborted") toast(t("toast_voice_error", {err: ev.error}));
+    };
+    recog.onend = function(){
+      stopUI();
+      $("jinput").focus();
+    };
+    $("jinput").addEventListener("input", function(){
+      if(!listening) voice.usedVoice = false;
+    });
+
+    micBtn.onclick = function(){
+      if(listening){ recog.stop(); return; }
+      if(window.speechSynthesis) window.speechSynthesis.cancel();
+      recog.lang = VOICE_LANGS[voice.lang];
+      try{
+        recog.start();
+        listening = true;
+        micBtn.classList.add("listening");
+      }catch(e){ stopUI(); }
+    };
+  })();
+
+  document.addEventListener("keydown", function(ev){
+    var tag = (ev.target.tagName || "").toLowerCase();
+    var typing = tag === "input" || tag === "textarea" || tag === "select";
+    if(ev.key === "Enter" && (ev.ctrlKey || ev.metaKey)){ ev.preventDefault(); if(!$("submitBtn").disabled) openSubmit(); return; }
+    if(typing) return;
+    if(document.querySelector("dialog[open]")) return;
+    if(ev.key === "j" || ev.key === "J"){ ev.preventDefault(); botToggle(); }
+    else if(ev.key === "n" || ev.key === "N"){ ev.preventDefault(); openQuick("", 2); }
+    else if((ev.key === "c" || ev.key === "C") && !isMonthly()){ ev.preventDefault(); copyWeek(); }
+    else if(ev.key === "ArrowLeft"){ ev.preventDefault(); changeWeek(-1); }
+    else if(ev.key === "ArrowRight"){ ev.preventDefault(); changeWeek(1); }
+    else if(ev.key === "?"){ ev.preventDefault(); $("dlgHelp").showModal(); }
+  });
+
+  /* ---------- wiring: company, allowances, team ---------- */
+  (function(){
+    var sel = $("coSel");
+    if(sel){
+      sel.value = IT0001.bukrs;
+      sel.onchange = function(){ switchCompany(sel.value); };
+    }
+    var ls = $("leadSel");
+    if(ls){
+      renderLeaderOptions();
+      ls.onchange = function(){
+        state.leader = ls.value;
+        var pj = $("mProj"); if(pj) pj.dataset.for = "";
+        clearMass();
+      };
+    }
+  })();
+  function setPanelOpen(panelId, togId, open){
+    var p = $(panelId), t = $(togId);
+    if(!p || !t) return;
+    p.classList.toggle("collapsed", !open);
+    t.textContent = open ? "▾" : "▸";
+    t.setAttribute("aria-expanded", open ? "true" : "false");
+  }
+  function setTeamTab(tab){
+    state.teamTab = tab;
+    var panels = {hours:"hoursPanel", allow:"teamAllowPanel", bonus:"bonusPanel"};
+    Object.keys(panels).forEach(function(k){
+      var p = $(panels[k]);
+      if(p) p.hidden = (k !== tab);
+    });
+    var buttons = {hours:"ttHours", allow:"ttAllow", bonus:"ttBonus"};
+    Object.keys(buttons).forEach(function(k){
+      var b = $(buttons[k]);
+      if(b) b.setAttribute("aria-pressed", k === tab ? "true" : "false");
+    });
+    /* "Already recorded" switches what it shows with the active tab: the
+       hours grid has nothing to say about allowances and vice versa. */
+    var showAllow = tab === "allow";
+    if($("alreadyHoursWrap")) $("alreadyHoursWrap").hidden = showAllow;
+    if($("alreadyAllowWrap")) $("alreadyAllowWrap").hidden = !showAllow;
+    if($("alreadyTitle")) $("alreadyTitle").textContent = showAllow ? t("hdr_already_allow") : t("hdr_already_recorded");
+    if($("alreadyHint")) $("alreadyHint").title = showAllow ? t("hint_already_allow") : t("hint_already");
+  }
+
+  if($("allowAdd")) $("allowAdd").onclick = openAllow;
+  if($("alCode")) $("alCode").onchange = syncAllowForm;
+  if($("alSave")) $("alSave").onclick = function(){ saveAllow(); };
+  if($("alCancel")) $("alCancel").onclick = function(){ $("dlgAllow").close(); };
+  if($("mProj")) $("mProj").onchange = renderTeam;
+  if($("mApply")) $("mApply").onclick = applyMass;
+  if($("mSave")) $("mSave").onclick = function(){ saveMass(); };
+  if($("teamSaveAll")) $("teamSaveAll").onclick = saveTeamAll;
+  if($("mClear")) $("mClear").onclick = function(){ clearMass(); toast(t("toast_staged_entries_cleared")); };
+  if($("bSave")) $("bSave").onclick = saveBonus;
+  if($("mAllowCode")) $("mAllowCode").onchange = syncMassAllowForm;
+  if($("mAllowApply")) $("mAllowApply").onclick = applyMassAllow;
+  if($("mAllowSave")) $("mAllowSave").onclick = function(){ saveMassAllow(); };
+  if($("mAllowClear")) $("mAllowClear").onclick = function(){ clearMassAllow(); toast(t("toast_staged_allow_cleared")); };
+
+  /* ---------- collapsible panels and in-screen tabs ----------
+     Pure display state: which mass-entry tab is showing, and a panel's
+     collapsed state, none of it part of the timesheet data, so it lives on
+     state.* but never touches WEEKS. */
+  if($("sugTog")) $("sugTog").onclick = function(){
+    state.sugManualOpen = $("sugPanel").classList.contains("collapsed");
+    setPanelOpen("sugPanel", "sugTog", state.sugManualOpen);
+  };
+  /* The icon alone (.pTog) was a ~24px target, easy to miss; the whole
+     header now opens/closes the panel, the icon is still there as the
+     visual affordance but isn't the only way in. */
+  if($("alreadyHead")) $("alreadyHead").onclick = function(){
+    setPanelOpen("alreadyPanel", "alreadyTog", $("alreadyPanel").classList.contains("collapsed"));
+  };
+  if($("allowHead")) $("allowHead").onclick = function(){
+    state.allowManualOpen = $("allowPanel").classList.contains("collapsed");
+    setPanelOpen("allowPanel", "allowTog", state.allowManualOpen);
+  };
+  /* Open by default for whoever hasn't seen it yet; remembered across
+     visits (not just this session) once collapsed, since its content
+     never changes and showing it again would just be in the way. */
+  (function(){
+    var open = true;
+    try{ var v = localStorage.getItem("vesiHowOpen"); if(v !== null) open = v === "1"; }catch(e){}
+    setPanelOpen("howPanel", "howTog", open);
+  })();
+  if($("howHead")) $("howHead").onclick = function(){
+    var open = $("howPanel").classList.contains("collapsed");
+    setPanelOpen("howPanel", "howTog", open);
+    try{ localStorage.setItem("vesiHowOpen", open ? "1" : "0"); }catch(e){}
+  };
+
+  if($("ttHours")) $("ttHours").onclick = function(){ state.teamTab = "hours"; renderTeam(); };
+  if($("ttAllow")) $("ttAllow").onclick = function(){ state.teamTab = "allow"; renderTeam(); };
+  if($("ttBonus")) $("ttBonus").onclick = function(){ state.teamTab = "bonus"; renderTeam(); };
+
+  applyLocaleArrays();
+  applyI18n();
+  render();
+})();
