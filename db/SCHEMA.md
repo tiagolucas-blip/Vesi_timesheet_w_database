@@ -56,9 +56,12 @@ de IA) é uma funcionalidade de aplicação, não dado SAP, e não tem tabela �
   uma correção cria uma nova linha com `refcounter` a apontar para a
   original e volta a passar por aprovação — replica o comportamento real do
   CATS descrito no próprio ecrã "CATS mapping" da app.
-- **AXI-INT** (trabalho interno, sem WBS) usa `prps_wbs_element.posid = NULL`
-  e lança diretamente a `rkostl` (centro de custo recetor) em vez de um
-  elemento WBS — só projetos faturáveis têm WBS próprio.
+- **AXI-INT** (trabalho interno) não tem nenhuma linha em `prps_wbs_element`
+  — não existe WBS para ele. Cada linha de horas em `catsdb` lança a um
+  recetor que é **ou** um elemento WBS (`posid`) **ou** um centro de custo
+  direto (`rkostl`), nunca os dois — tal como no CATS real. AXI-INT usa
+  sempre `rkostl`; os restantes projetos (faturáveis, com WBS) usam sempre
+  `posid`. O `CHECK` em `catsdb` garante esta exclusividade.
 - Sem histórico de validade (`begda`/`endda`) completo em todas as tabelas
   que o SAP real versiona (ex.: `pa0002`); mantém-se apenas onde a app usa a
   validade (ex.: `pa0001`, `pa0007`, `ztime_company_cfg`).

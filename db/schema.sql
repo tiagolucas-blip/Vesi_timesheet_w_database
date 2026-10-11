@@ -117,10 +117,9 @@ CREATE TABLE prps_wbs_element (
   post1   VARCHAR(40)  NOT NULL,       -- WBS element short text
   lstar   CHAR(6)      NOT NULL REFERENCES csla_activity_type(lstar),
   skostl  CHAR(8)      REFERENCES csks_cost_center(kostl),  -- sending cost center
-  rkostl  CHAR(8)      REFERENCES csks_cost_center(kostl),  -- receiving cost center (non-project bookings)
   aufnr   VARCHAR(12)                  -- internal order, unused today but modeled (always NULL here)
 );
-COMMENT ON TABLE prps_wbs_element IS 'SAP PRPS (WBS Element). AXI-INT (internal work) has no WBS, books to rkostl only.';
+COMMENT ON TABLE prps_wbs_element IS 'SAP PRPS (WBS Element). AXI-INT (internal work) has no WBS at all — see catsdb.rkostl, the direct-to-cost-center receiver a CATS line uses instead of a PSPNR, exactly as in real SAP where a line''s receiver is either a WBS element or a cost center, never both.';
 
 -- ============================================================================
 -- Time recording — the center of the whole app
@@ -134,7 +133,8 @@ CREATE TABLE catsdb (
   catsdb_id    BIGSERIAL    PRIMARY KEY,                -- surrogate key; real CATSDB keys on WORKDATE+PERNR+COUNTER
   pernr        CHAR(8)      NOT NULL REFERENCES pa0002_personal_data(pernr),
   workdate     DATE         NOT NULL,                   -- one row per calendar day, never aggregated to the week
-  posid        VARCHAR(20)  REFERENCES prps_wbs_element(posid),  -- RPROJ; NULL only impossible in practice, every row books somewhere
+  posid        VARCHAR(20)  REFERENCES prps_wbs_element(posid),  -- RPROJ, the WBS receiver (project work)
+  rkostl       CHAR(8)      REFERENCES csks_cost_center(kostl),  -- direct cost-center receiver (non-project work, e.g. AXI-INT) — exactly one of posid/rkostl on an hours row
   lstar        CHAR(6)      REFERENCES csla_activity_type(lstar),
   catshours    NUMERIC(5,2) NOT NULL DEFAULT 0,          -- recorded hours (Z_CONS duration, or computed from BEGUZ/ENDUZ)
   beguz        TIME,                                     -- start time, Z_BSRV only
@@ -155,7 +155,7 @@ CREATE TABLE catsdb (
   changed_at   TIMESTAMPTZ  NOT NULL DEFAULT now(),
 
   CHECK (
-    (lgart IS NULL AND awart IS NULL)      -- a plain hours row, or
+    (lgart IS NULL AND awart IS NULL AND (posid IS NOT NULL) <> (rkostl IS NOT NULL))  -- an hours row: exactly one receiver, or
     OR (lgart IS NOT NULL AND awart IS NULL)  -- an allowance/bonus row, or
     OR (lgart IS NULL AND awart IS NOT NULL)  -- an absence marker row
   )
