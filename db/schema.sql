@@ -145,8 +145,13 @@ CREATE TABLE catsdb (
   catsamount   NUMERIC(13,2),                             -- bonus amount, native CATSDB field (CURR 13,2)
   awart        CHAR(4)      REFERENCES t554t_absence_type(awart),  -- set when this row IS an absence marker, else NULL
   long_text    VARCHAR(300),                              -- free-text description (LTXA1 truncates this to 40 on transfer)
-  status       VARCHAR(12)  NOT NULL DEFAULT 'DRAFT'       -- DRAFT / SAVED / APPROVED / TRANSFERRED / REJECTED
-    CHECK (status IN ('DRAFT','SAVED','APPROVED','TRANSFERRED','REJECTED')),
+  status       VARCHAR(12)  NOT NULL DEFAULT 'DRAFT'       -- real CATS status codes: 10/20/30/40/50
+    CHECK (status IN ('DRAFT','SAVED','SUBMITTED','APPROVED','TRANSFERRED','REJECTED')),
+    -- DRAFT: being edited, not yet saved. SAVED: saved, not yet released
+    -- (Save button). SUBMITTED: released for approval (Submit button),
+    -- status 20. APPROVED: a manager approved it, status 30 — distinct
+    -- from the employee's own submit; ztime_approval.approved is a
+    -- queue-level reflection of this. TRANSFERRED/REJECTED: status 40/50.
   origin       VARCHAR(12)  NOT NULL DEFAULT 'Manual'
     CHECK (origin IN ('Manual','Suggested','Joule')),
   created_by   CHAR(8)      REFERENCES pa0002_personal_data(pernr),  -- CPUID/ERNAM equivalent: who actually typed it in

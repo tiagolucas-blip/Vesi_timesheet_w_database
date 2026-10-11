@@ -59,6 +59,12 @@ de IA) é uma funcionalidade de aplicação, não dado SAP, e não tem tabela �
   allowance/bónus (`LGART`+`ANZHL`/`CATSAMOUNT`) e marcadores de ausência
   (`AWART`) na mesma tabela — por isso o `CHECK` garante que cada linha é
   exatamente um destes três tipos, nunca uma mistura.
+- **Estados (`catsdb.status`)**: `DRAFT` (a editar, ainda não guardado) →
+  `SAVED` (Save) → `SUBMITTED` (Submit, liberta para aprovação) →
+  `APPROVED`/`REJECTED` (decisão do gestor) → `TRANSFERRED` (exportado para
+  o alvo). `SUBMITTED` é distinto de `APPROVED`: o próprio colaborador
+  submete, só o gestor aprova — a app já impõe esta regra de negócio
+  (Save obrigatório antes do Submit).
 - **Correções**: uma linha `TRANSFERRED`/`APPROVED` nunca é editada in-place;
   uma correção cria uma nova linha com `refcounter` a apontar para a
   original e volta a passar por aprovação — replica o comportamento real do
